@@ -335,10 +335,12 @@ class TradingSystem:
                          "status": "FAILED", "error": str(exc)}
                 exec_results.append(r)
                 executed_instructions.append(final_ins)
+                order_id = r.get("order_id")
                 logger.info(
-                    "执行结果 %s %s -> %s%s",
+                    "执行结果 %s %s -> %s%s%s",
                     r.get("symbol"), r.get("action"), r.get("status"),
                     " (DRY_RUN)" if config.dry_run else "",
+                    f" orderId={order_id}" if order_id else "",
                 )
             result["confirmations"] = confirmations
         else:
