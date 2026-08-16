@@ -55,6 +55,13 @@ class Config:
         # 推理强度三档（仿照 TradingAgents reasoning_effort）：low / medium / high，空=不设置
         self.llm_reasoning_effort = os.getenv("LLM_REASONING_EFFORT", "").strip().lower()
         self.llm_temperature = _get_float("LLM_TEMPERATURE", 0.2)
+        # 备用分析 LLM（主 LLM API 失效时切换）；任一项留空则回退到主 LLM 对应配置
+        self.llm_backup_api_key = os.getenv("LLM_BACKUP_API_KEY", "")
+        self.llm_backup_base_url = os.getenv("LLM_BACKUP_BASE_URL", "")
+        self.llm_backup_model = os.getenv("LLM_BACKUP_MODEL", "")
+        # 主/备用 LLM 均失效时的连通性确认：尝试次数与每次间隔（秒）
+        self.llm_emergency_attempts = _get_int("LLM_EMERGENCY_ATTEMPTS", 5)
+        self.llm_emergency_interval = _get_int("LLM_EMERGENCY_INTERVAL", 60)
 
         # ---- 交易标的 ----
         raw_symbols = os.getenv("SYMBOLS", "BTCUSDT,ETHUSDT,SOLUSDT")
@@ -73,6 +80,10 @@ class Config:
         self.interval_minutes = _get_int("INTERVAL_MINUTES", 60)
         self.klines_limit = _get_int("KLINES_LIMIT", 500)
         self.logs_dir = BASE_DIR / "logs"
+        # 条件唤醒：模型可在正常循环外设定价格触发条件，满足时提前唤醒分析
+        self.watch_enabled = _get_bool("WATCH_ENABLED", True)
+        self.watch_check_interval = _get_int("WATCH_CHECK_INTERVAL", 30)  # 秒
+        self.watch_max_age_hours = _get_int("WATCH_MAX_AGE_HOURS", 24)  # 小时
 
     def validate(self) -> None:
         """启动前校验关键配置，缺失时给出明确错误。"""

@@ -23,11 +23,12 @@ import time
 from datetime import datetime
 from typing import Optional
 
-from agents.decision_maker import DecisionMaker
-from agents.llm import LLMClient
+from agents.confirmer import Confirmer
+from agents.decision_maker import DecisionMaker, format_account_context
+from agents.llm import AllLLMUnavailable, LLMClient
 from agents.market_analyst import MarketAnalyst
 from agents.reflector import Reflector
-from agents.schemas import ExperienceAction
+from agents.schemas import ConfirmationAction, ExperienceAction
 from config import config
 from trading.binance_client import BinanceClient
 from trading.experience import ExperienceStore
@@ -36,6 +37,7 @@ from trading.hypothesis import HypothesisStore, build_hypothesis_check_context
 from trading.market import MarketDataService
 from trading.news import NewsService
 from trading.risk import RiskManager
+from trading.watch import WatchStore
 
 logging.basicConfig(
     level=logging.INFO,
@@ -44,21 +46,9 @@ logging.basicConfig(
 logger = logging.getLogger("trading_system")
 
 
-def _format_account_ctx(account) -> str:
-    """将账户现状格式化为反思者用的 markdown 上下文。"""
-    lines = [
-        f"- 账户权益: {account.margin_balance:.4f} USDT",
-        f"- 可用余额: {account.available_balance:.4f} USDT",
-        f"- 未实现盈亏: {account.unrealized_pnl:+.4f} USDT",
-    ]
-    for p in account.positions:
-        direction = "多" if p.position_amt > 0 else "空"
-        lines.append(
-            f"- 持仓 {p.symbol} {direction} qty={abs(p.position_amt):.6g} "
-            f"entry={p.entry_price:.6g} mark={p.mark_price:.6g} "
-            f"pnl={p.unrealized_pnl:+.4f} lev={p.leverage:g}"
-        )
-    return "\n".join(lines)
+def _format_account_ctx(account, open_orders_by_symbol=None) -> str:
+    """账户现状 markdown（余额/持仓/未成交挂单），供确认者与反思者使用。"""
+    return format_account_context(account, open_orders_by_symbol)
 
 
 class TradingSystem:
@@ -74,19 +64,33 @@ class TradingSystem:
         # 两档模型分工（仿照 TradingAgents 的 deep/quick 分工）：
         # - quick_think_llm（LLM_MODEL）：市场分析师、反思者 —— 快速任务
         # - deep_think_llm（LLM_DEEP_MODEL）：决策者/研究经理 —— 复杂推理
-        self.llm = LLMClient()
+        # 两者都挂同一个备用 LLM（LLM_BACKUP_*）：主 API 失效时自动切换
+        backup_llm = None
+        if config.llm_backup_model:
+            backup_llm = LLMClient(
+                api_key=config.llm_backup_api_key or config.llm_api_key,
+                base_url=config.llm_backup_base_url or config.llm_base_url,
+                model=config.llm_backup_model,
+            )
+            logger.info("已启用备用 LLM: %s", backup_llm.model)
+        self.llm = LLMClient(fallback=backup_llm)
         self.llm_deep = (
-            LLMClient(model=config.llm_deep_model) if config.llm_deep_model else self.llm
+            LLMClient(model=config.llm_deep_model, fallback=backup_llm)
+            if config.llm_deep_model
+            else self.llm
         )
         self.market_data = MarketDataService(self.client)
         self.news_service = NewsService()
         self.market_analyst = MarketAnalyst(self.llm)
         self.decision_maker = DecisionMaker(self.llm_deep)
         self.reflector = Reflector(self.llm)
+        # 执行前逐条确认者（用 quick 模型：单条指令的轻量复核）
+        self.confirmer = Confirmer(self.llm)
         self.risk = RiskManager()
         self.executor = OrderExecutor(self.client, self.risk)
         self.hypotheses = HypothesisStore()
         self.experiences = ExperienceStore()
+        self.watch_store = WatchStore(max_age_hours=config.watch_max_age_hours)
         self.symbols = config.symbols
         self._last_reflection: Optional[dict] = None
 
@@ -125,6 +129,25 @@ class TradingSystem:
             ],
         }
 
+        # 1.5 未成交挂单（决策者/确认者管理挂单、调止盈止损必需：含订单ID）
+        open_orders_by_symbol: dict[str, list] = {}
+        for sym in self.symbols:
+            try:
+                open_orders_by_symbol[sym] = self.client.get_open_orders(sym)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("获取 %s 未成交挂单失败: %s", sym, exc)
+                open_orders_by_symbol[sym] = []
+        result["open_orders"] = {
+            sym: [
+                {"orderId": o.get("orderId"), "side": o.get("side"), "type": o.get("type"),
+                 "price": o.get("price"), "stopPrice": o.get("stopPrice"),
+                 "qty": o.get("origQty"), "filled": o.get("executedQty"),
+                 "reduceOnly": o.get("reduceOnly"), "status": o.get("status")}
+                for o in orders
+            ]
+            for sym, orders in open_orders_by_symbol.items()
+        }
+
         # 2. 假设检查上下文：无仓位则从零分析，并清理失效假设
         account_positions = {p.symbol: p for p in account.positions}
         for sym in self.symbols:
@@ -158,6 +181,8 @@ class TradingSystem:
         try:
             market_report = self.market_analyst.analyze(market_context, news_context)
             logger.info("市场分析报告已生成（%d 字符）", len(market_report))
+        except AllLLMUnavailable as exc:
+            return self._handle_llm_outage(exc, result)
         except Exception as exc:  # noqa: BLE001
             logger.error("市场分析失败: %s", exc)
             result["error"] = f"市场分析失败: {exc}"
@@ -170,18 +195,29 @@ class TradingSystem:
             decision = self.decision_maker.decide(
                 market_report, news_context, hypothesis_context, account,
                 experience_context=experience_context,
+                open_orders_by_symbol=open_orders_by_symbol,
             )
             logger.info(
                 "决策: %d 条指令, 评估=%s",
                 len(decision.instructions),
                 decision.market_assessment[:120],
             )
+        except AllLLMUnavailable as exc:
+            return self._handle_llm_outage(exc, result)
         except Exception as exc:  # noqa: BLE001
             logger.error("决策失败: %s", exc)
             result["error"] = f"决策失败: {exc}"
             return result
         result["market_assessment"] = decision.market_assessment
         result["risk_notes"] = decision.risk_notes
+        # 5.5 更新唤醒条件（模型可在正常循环外设定价格触发，全量替换）
+        result["watch_conditions"] = [
+            c.model_dump() for c in decision.watch_conditions
+        ]
+        try:
+            self.watch_store.replace(decision.watch_conditions)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("更新唤醒条件失败: %s", exc)
 
         # 6. 风控校验
         price_map: dict[str, float] = {}
@@ -211,33 +247,149 @@ class TradingSystem:
             for i in passed
         ]
 
-        # 7. 执行
+        # 7. 逐条确认后执行：每条指令执行前调用确认者复核，
+        #    确认过程中模型可 PROCEED / SKIP / REPLACE（输出修正后的新指令）
+        exec_results: list[dict] = []
+        executed_instructions: list = []  # 实际执行的指令（含 REPLACE 修正后）
+        confirmations: list[dict] = []
         if passed:
-            exec_results = self.executor.execute(passed, account)
-            result["execution"] = exec_results
-            for r in exec_results:
+            account_snapshot = account
+            for ins in passed:
+                # 刷新最新价格（前几条执行可能已影响行情判断）
+                try:
+                    mark = self.client.get_ticker_price(ins.symbol)
+                except Exception:  # noqa: BLE001
+                    mark = price_map.get(ins.symbol, 0)
+                # 刷新账户（真实模式下前几条执行会改变持仓/余额）
+                try:
+                    account_snapshot = self.client.get_account()
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("刷新账户失败（沿用轮起始快照）: %s", exc)
+                # 刷新该币种未成交挂单（前几条指令可能已撤销/新挂单）
+                try:
+                    open_orders_by_symbol[ins.symbol] = self.client.get_open_orders(ins.symbol)
+                except Exception:  # noqa: BLE001
+                    pass
+                prior_summary = "\n".join(
+                    f"- {r.get('symbol')} {r.get('action')} -> {r.get('status')}"
+                    for r in exec_results
+                )
+                # 执行前逐条确认
+                try:
+                    conf = self.confirmer.confirm(
+                        ins, mark, _format_account_ctx(account_snapshot, open_orders_by_symbol),
+                        prior_summary, decision.market_assessment,
+                    )
+                except AllLLMUnavailable as exc:
+                    return self._handle_llm_outage(exc, result)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("指令确认失败，跳过 %s: %s", ins.symbol, exc)
+                    exec_results.append({
+                        "symbol": ins.symbol, "action": ins.action.value,
+                        "status": "SKIPPED", "error": f"确认失败: {exc}",
+                    })
+                    continue
+                confirmations.append({
+                    "symbol": ins.symbol, "decision": conf.decision.value,
+                    "reason": conf.reason,
+                })
+                if conf.decision == ConfirmationAction.SKIP:
+                    logger.info("确认者 SKIP %s: %s", ins.symbol, conf.reason[:120])
+                    exec_results.append({
+                        "symbol": ins.symbol, "action": ins.action.value,
+                        "status": "SKIPPED", "error": conf.reason,
+                    })
+                    continue
+
+                final_ins = ins
+                if conf.decision == ConfirmationAction.REPLACE:
+                    new_ins = conf.instruction
+                    info = symbol_info_map.get(new_ins.symbol)
+                    m = price_map.get(new_ins.symbol, 0)
+                    if info is None or m <= 0:
+                        logger.warning("REPLACE 缺少 %s 价格/精度信息，跳过", new_ins.symbol)
+                        exec_results.append({
+                            "symbol": new_ins.symbol, "action": "REPLACE",
+                            "status": "SKIPPED", "error": "缺少价格/精度信息",
+                        })
+                        continue
+                    r = self.risk.validate_instruction(new_ins, account_snapshot, info, m)
+                    if not r.ok:
+                        logger.warning(
+                            "REPLACE 新指令未过风控，跳过 %s: %s",
+                            new_ins.symbol, "; ".join(r.errors),
+                        )
+                        exec_results.append({
+                            "symbol": new_ins.symbol, "action": "REPLACE",
+                            "status": "SKIPPED", "error": "; ".join(r.errors),
+                        })
+                        continue
+                    final_ins = new_ins
+                    logger.info("确认者 REPLACE %s -> 新指令已过风控", new_ins.symbol)
+
+                # 执行单条
+                try:
+                    r = self.executor.execute([final_ins], account_snapshot)[0]
+                except Exception as exc:  # noqa: BLE001
+                    r = {"symbol": final_ins.symbol, "action": final_ins.action.value,
+                         "status": "FAILED", "error": str(exc)}
+                exec_results.append(r)
+                executed_instructions.append(final_ins)
                 logger.info(
                     "执行结果 %s %s -> %s%s",
                     r.get("symbol"), r.get("action"), r.get("status"),
                     " (DRY_RUN)" if config.dry_run else "",
                 )
+            result["confirmations"] = confirmations
         else:
             logger.info("无通过风控的指令，本轮不交易")
-            exec_results = []
-            result["execution"] = []
+        result["execution"] = exec_results
 
         # 8. 记录开仓/调仓理由到假设存储（供下一轮检查行情是否偏离）
-        self._record_hypotheses(passed, exec_results, account, decision, price_map)
+        self._record_hypotheses(
+            executed_instructions, exec_results, account, decision, price_map
+        )
 
         # 9. 反思者复盘本轮，自主维护经验库（写入/修改/删除）
         self._reflect_and_apply(
             decision, exec_results, account, hypothesis_context, market_report,
+            open_orders_by_symbol=open_orders_by_symbol,
         )
         if self._last_reflection:
             result["reflection"] = self._last_reflection
 
         logger.info("===== 本轮结束 =====")
         return result
+
+    def _handle_llm_outage(self, exc, result: dict) -> dict:
+        """所有 LLM API 均无法正常通讯：立即市价平掉全部持仓，本轮结束。
+
+        由 LLMClient 在「主→备→按间隔确认多次仍失败」后抛出的
+        AllLLMUnavailable 触发；平仓不依赖 LLM，仅用币安 API（reduceOnly）。
+        """
+        logger.error("所有 LLM API 均不可用，触发紧急平仓: %s", exc)
+        try:
+            account = self.client.get_account()
+            emerg = self.executor.flatten_all(account, reason="LLM API 全部不可用")
+            result["emergency_flatten"] = emerg
+            for r in emerg:
+                logger.warning(
+                    "紧急平仓 %s %s -> %s",
+                    r.get("symbol"), r.get("side"), r.get("status"),
+                )
+        except Exception as e:  # noqa: BLE001
+            logger.error("紧急平仓失败: %s", e)
+            result["emergency_flatten_error"] = str(e)
+        result["error"] = f"所有 LLM API 均无法正常通讯，已执行紧急平仓: {exc}"
+        return result
+
+    def _emergency_flatten(self, reason: str) -> None:
+        """仅执行紧急平仓（无 result 上下文时用，如反思环节）。"""
+        try:
+            account = self.client.get_account()
+            self.executor.flatten_all(account, reason=reason)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("紧急平仓失败: %s", exc)
 
     def _reflect_and_apply(
         self,
@@ -246,6 +398,7 @@ class TradingSystem:
         account,
         hypothesis_context: str,
         market_report: str,
+        open_orders_by_symbol: dict | None = None,
     ) -> None:
         """运行反思者并应用经验库操作。"""
         from trading.hypothesis import build_hypothesis_check_context
@@ -268,7 +421,7 @@ class TradingSystem:
                 market_report=market_report,
                 decision_summary=decision_summary,
                 execution_results=exec_results,
-                account_context=_format_account_ctx(account),
+                account_context=_format_account_ctx(account, open_orders_by_symbol),
                 experience_context=self.experiences.format_for_context(),
                 previous_context=prev_ctx,
             )
@@ -279,6 +432,10 @@ class TradingSystem:
             logger.info("反思评估: %s", reflection.self_assessment[:120])
             for op in reflection.experience_ops:
                 self._apply_experience_op(op)
+        except AllLLMUnavailable as exc:
+            # 反思环节 LLM 全部不可用：本轮刚执行过交易，立即紧急平仓撤退
+            logger.error("反思环节所有 LLM 均不可用，执行紧急平仓: %s", exc)
+            self._emergency_flatten("反思环节 LLM API 全部不可用")
         except Exception as exc:  # noqa: BLE001
             logger.warning("反思环节失败（不影响本轮交易）: %s", exc)
 
@@ -344,7 +501,8 @@ class TradingSystem:
             if ins is None:
                 continue
             action = r.get("action")
-            if action in ("OPEN_LONG", "OPEN_SHORT"):
+            # 仅记录真正执行的 OPEN（DRY_RUN 演练 / OPENED 成交），失败/跳过不写假设
+            if action in ("OPEN_LONG", "OPEN_SHORT") and r.get("status") in ("DRY_RUN", "OPENED"):
                 pos_side = "LONG" if action == "OPEN_LONG" else "SHORT"
                 entry = ins.price or price_map.get(symbol, 0)
                 self.hypotheses.set(symbol, {
@@ -361,10 +519,11 @@ class TradingSystem:
                 logger.info("已记录 %s 开仓假设: %s", symbol, ins.reason[:100])
 
     def run_loop(self) -> None:
-        """循环模式：每 interval 分钟执行一轮。"""
+        """循环模式：每 interval 分钟执行一轮；若模型设定唤醒条件，条件满足时提前执行。"""
         logger.info(
-            "启动循环模式，间隔 %d 分钟（测试网=%s DRY_RUN=%s）",
+            "启动循环模式，间隔 %d 分钟（测试网=%s DRY_RUN=%s 条件唤醒=%s）",
             self.interval_minutes, config.binance_testnet, config.dry_run,
+            config.watch_enabled,
         )
         while True:
             started = time.time()
@@ -374,8 +533,50 @@ class TradingSystem:
                 logger.exception("循环中出现未处理异常: %s", exc)
             elapsed = time.time() - started
             sleep_sec = max(self.interval_minutes * 60 - elapsed, 10)
-            logger.info("下一轮将在 %.0f 秒后进行", sleep_sec)
-            time.sleep(sleep_sec)
+            if config.watch_enabled and self.watch_store.count() > 0:
+                if self._wait_for_trigger_or_sleep(sleep_sec):
+                    logger.info("唤醒条件触发，提前开始新一轮分析")
+                    continue
+                logger.info("等待 %d 秒无唤醒条件触发，按计划进入下一轮", sleep_sec)
+            else:
+                logger.info("下一轮将在 %.0f 秒后进行", sleep_sec)
+                time.sleep(sleep_sec)
+
+    def _wait_for_trigger_or_sleep(self, sleep_sec: float) -> bool:
+        """等待 sleep_sec 秒，期间按 WATCH_CHECK_INTERVAL 轮询唤醒条件；满足则提前返回 True。"""
+        deadline = time.time() + sleep_sec
+        while True:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                return False
+            wait = min(max(config.watch_check_interval, 1), remaining)
+            time.sleep(wait)
+            if self._check_watch_triggers():
+                return True
+
+    def _check_watch_triggers(self) -> bool:
+        """轮询当前价并核对唤醒条件；任一满足则清除条件并返回 True。"""
+        triggered: list[tuple[dict, float]] = []
+        for t in self.watch_store.all():
+            try:
+                price = self.client.get_ticker_price(t["symbol"])
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("检查 %s 唤醒条件失败: %s", t["symbol"], exc)
+                continue
+            cond, val = t.get("condition"), t.get("value")
+            if cond == "price_above" and price >= val:
+                triggered.append((t, price))
+            elif cond == "price_below" and price <= val:
+                triggered.append((t, price))
+        if triggered:
+            detail = "; ".join(
+                f"{t['symbol']} {t['condition']}@{t['value']:g}（现价 {price:.6g}）"
+                for t, price in triggered
+            )
+            logger.warning("唤醒条件触发: %s", detail)
+            self.watch_store.clear_all(reason="条件已触发")
+            return True
+        return False
 
 
 def main() -> None:

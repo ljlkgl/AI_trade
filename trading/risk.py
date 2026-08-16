@@ -73,6 +73,42 @@ class RiskManager:
         if instruction.action == OrderAction.HOLD:
             return RiskCheckResult(ok=True, errors=[])
 
+        # 挂单管理类：不涉及保证金/杠杆/止损，仅校验必要字段
+        if instruction.action == OrderAction.CANCEL_ORDERS:
+            return RiskCheckResult(ok=True, errors=[])
+        if instruction.action == OrderAction.REPLACE_LIMIT:
+            if instruction.quantity is None or instruction.quantity <= 0:
+                errors.append(f"{instruction.symbol}: REPLACE_LIMIT 必须提供 quantity>0")
+            if instruction.price is None or instruction.price <= 0:
+                errors.append(f"{instruction.symbol}: REPLACE_LIMIT 必须提供 price>0")
+            if instruction.side not in ("BUY", "SELL"):
+                errors.append(f"{instruction.symbol}: REPLACE_LIMIT 必须提供 side=BUY/SELL")
+            return RiskCheckResult(ok=len(errors) == 0, errors=errors)
+
+        # 止盈止损调整类：必须已有持仓，且止损/止盈方向相对当前价合理
+        if instruction.action == OrderAction.SET_SL_TP:
+            pos = self.current_position(account, instruction.symbol)
+            ref_price = instruction.price or mark_price
+            if pos is None:
+                errors.append(f"{instruction.symbol}: 无持仓，无法调整止盈止损")
+            else:
+                sl, tp = instruction.stop_loss, instruction.take_profit
+                if sl is None and tp is None:
+                    errors.append(
+                        f"{instruction.symbol}: SET_SL_TP 必须提供 stop_loss 或 take_profit 至少一个"
+                    )
+                if sl is not None:
+                    if pos.position_amt > 0 and sl >= ref_price:
+                        errors.append(f"{instruction.symbol}: 多仓止损价需低于当前价 {ref_price}")
+                    if pos.position_amt < 0 and sl <= ref_price:
+                        errors.append(f"{instruction.symbol}: 空仓止损价需高于当前价 {ref_price}")
+                if tp is not None:
+                    if pos.position_amt > 0 and tp <= ref_price:
+                        errors.append(f"{instruction.symbol}: 多仓止盈价需高于当前价 {ref_price}")
+                    if pos.position_amt < 0 and tp >= ref_price:
+                        errors.append(f"{instruction.symbol}: 空仓止盈价需低于当前价 {ref_price}")
+            return RiskCheckResult(ok=len(errors) == 0, errors=errors)
+
         pos = self.current_position(account, instruction.symbol)
 
         # 开仓类：校验杠杆 + 名义价值 + 保证金（仓位大小交给模型自主决定）

@@ -121,7 +121,52 @@ python main.py --interval 30
 | `CLOSE_LONG` | 平多 | 数量缺省=全部 |
 | `CLOSE_SHORT` | 平空 | 数量缺省=全部 |
 | `FLATTEN` | 清仓该币种 | 全部持仓平掉 |
+| `CANCEL_ORDERS` | 撤销挂单 | 撤销该币种**全部未成交限价单**；只给 symbol + reason |
+| `REPLACE_LIMIT` | 更改挂单 | 先撤销全部挂单再重挂：**必须**给 side=BUY/SELL、quantity、price（新价） |
+| `SET_SL_TP` | 调整止盈止损 | 调整**已有持仓**的止损/止盈：至少给 stop_loss 或 take_profit 一个；系统先撤旧保护单再按新价重挂 |
 | `HOLD` | 持有不动 | 不产生订单 |
+
+> 挂单管理说明：未成交的 LIMIT 单不占保证金、不影响持仓；`CANCEL_ORDERS` / `REPLACE_LIMIT`
+> 不会触碰已有仓位，也无需带止损。模型在下 LIMIT 开仓单后，若价格迟迟未触及可随时撤销或改价重挂。
+>
+> 止盈止损调整说明：`SET_SL_TP` 只作用于已有持仓（无持仓会被风控拦截），可随时上移/下移
+> 止损与止盈（行情走好后锁定利润、行情反转时收紧风险）；多仓要求 止损<现价<止盈，空仓相反，
+> 方向不合理会被风控拦截。
+
+## 执行前逐条确认（Confirmer）
+
+决策者输出完整 JSON 后，**每一条指令实际下单前**都会再调用确认者复核一次，
+以便及时发现并修正参数错误（价格/数量/方向/止损距离等）：
+
+1. 决策者输出 N 条指令 → 风控校验 → 逐条进入确认环节；
+2. 每条指令执行前，确认者收到：该指令全文 + 该币种最新价格 + **最新账户现状**（前几条
+   已执行可能已改变持仓/余额）+ 本轮已执行结果摘要；
+3. 确认者返回三选一：
+   - `PROCEED`：指令合理，原样执行；
+   - `SKIP`：指令有问题且无法可靠修正，跳过本指令；
+   - `REPLACE`：**输出修正后的完整新指令**替换执行（新指令会**重新过一遍风控**，
+     不通过则跳过）；
+4. 确认期间 LLM 全部不可用（主备均失效）同样触发紧急平仓；单次确认失败则保守跳过该指令。
+
+确认者使用快速模型（quick），只做轻量复核；完整决策仍由决策者（deep）负责。
+每轮确认结果记录在 `result["confirmations"]`，执行结果在 `result["execution"]`。
+
+## 条件唤醒（Watch Triggers）
+
+系统默认按固定间隔循环分析；模型可以在每轮决策中设定**唤醒条件**，让系统在
+正常循环外**提前唤醒**自己（例如价格触及关键位时），避免错过行情：
+
+1. 决策者输出 `watch_conditions`（与 instructions 平级）：
+   `[{"symbol": "BTCUSDT", "condition": "price_above", "value": 102000, "note": "突破追多"}]`
+2. `condition` 支持：`price_above`（价格≥value 唤醒）、`price_below`（价格≤value 唤醒）；
+3. 空列表=清除所有唤醒条件；非空列表=全量替换上一轮条件；
+4. 循环等待期间，系统按 `WATCH_CHECK_INTERVAL`（默认 30 秒）轮询价格，
+   任一条件满足立即提前执行一轮完整分析；
+5. 条件为**一次性**：触发后自动清除，过期（`WATCH_MAX_AGE_HOURS`，默认 24h）自动失效；
+   下一轮决策会重新设定。
+
+配置项：`WATCH_ENABLED`（开关，默认 true）、`WATCH_CHECK_INTERVAL`、`WATCH_MAX_AGE_HOURS`。
+条件持久化在 `state/watch_triggers.json`，结果记录在 `result["watch_conditions"]`。
 
 模型同时收到**账户现状**与**持仓假设检查**：
 
@@ -134,6 +179,11 @@ python main.py --interval 30
 | 币种 | 方向 | 数量 | 开仓均价 | 标记价格 | 未实现盈亏 | 杠杆 | 强平价 |
 | BTCUSDT | 多 | 0.1 | 60000 | 61000 | +100 | 15 | 55000 |
 
+## 未成交挂单（open orders）
+### BTCUSDT
+- orderId=888001 BUY LIMIT price=95000.00 stopPrice=0 qty=0.050 filled=0 reduceOnly=False status=NEW
+- orderId=888002 SELL STOP_MARKET price=0 stopPrice=94000.00 qty=0.050 filled=0 reduceOnly=True status=NEW
+
 # 持仓假设检查（上次开仓/调仓理由 vs 当前行情）
 ## BTCUSDT
 - 开仓时间: 2026-08-15T10:00:00
@@ -142,6 +192,12 @@ python main.py --interval 30
 - 当前持仓: 数量 0.05  标记价 98000  未实现盈亏 +150.0000
 - 相对开仓价偏离: +3.16%（顺向）
 ```
+
+账户上下文包含模型决策与挂单管理所需的**全部信息**：权益/可用余额/未实现盈亏、
+持仓（方向/数量/开仓均价/标记价/强平价）、以及**所有未成交挂单**（含 `orderId`、类型、
+方向、价格、触发价、数量、已成交量、reduceOnly 标志、状态）——模型可据此决定
+`CANCEL_ORDERS` / `REPLACE_LIMIT` / `SET_SL_TP`；确认者（Confirmer）在每条指令执行前
+也会收到同样的最新账户与挂单快照。
 
 ## 服务器部署
 
@@ -199,3 +255,25 @@ TradingAgents 用 `deep_think_llm` / `quick_think_llm` 两个模型按任务复�
 
 注意：部分 OpenAI 兼容接口（如某些 SenseNova/DeepSeek 网关）不接受
 `reasoning_effort` 参数，系统检测到接口报错后会自动移除该参数降级重试，不会中断运行。
+
+## 备用 LLM 与紧急平仓
+
+主 LLM API 故障时系统自动降级，链路如下：
+
+1. **主 LLM 调用失败**（含内部快速重试）→ 自动切换到**备用 LLM**（`LLM_BACKUP_*`），
+   市场分析师 / 决策者 / 反思者所有环节共用同一个备用；
+2. **备用也失败** → 进入**连通性确认**：按 `LLM_EMERGENCY_INTERVAL` 秒间隔、
+   连续尝试 `LLM_EMERGENCY_ATTEMPTS` 次（每次先主后备用）；
+3. 确认全部不可用 → **立即市价平掉当前所有持仓**（reduceOnly，不依赖 LLM），
+   本轮结束，等待下一轮重新尝试。
+
+| 配置项 | 用途 | 默认 |
+|---|---|---|
+| `LLM_BACKUP_API_KEY` | 备用 LLM Key；留空回退主 Key | 空 |
+| `LLM_BACKUP_BASE_URL` | 备用 LLM 接口地址；留空回退主地址 | 空 |
+| `LLM_BACKUP_MODEL` | 备用模型名；**留空则不启用备用** | 空 |
+| `LLM_EMERGENCY_ATTEMPTS` | 主备全失效后的确认尝试次数 | 5 |
+| `LLM_EMERGENCY_INTERVAL` | 每次确认尝试的间隔（秒） | 60 |
+
+紧急平仓尊重 `DRY_RUN`：演练模式下只打印不平仓；真实模式用市价 reduceOnly 单，
+平仓失败会记录错误并留待下一轮重试。

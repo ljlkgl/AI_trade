@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
 from typing import Any, Optional
 
 from openai import OpenAI
@@ -22,8 +23,18 @@ class LLMError(Exception):
     """LLM 调用或解析失败。"""
 
 
+class AllLLMUnavailable(LLMError):
+    """主 LLM 与备用 LLM 均无法正常通讯（已按间隔确认多次）。"""
+
+
 class LLMClient:
-    """轻量 OpenAI 兼容客户端。"""
+    """轻量 OpenAI 兼容客户端。
+
+    故障切换：
+    1. 主 LLM 调用失败（含内部重试）→ 自动切到备用 LLM（fallback）；
+    2. 备用也失败 → 按 confirm_interval 间隔尝试 confirm_attempts 次（每次先主后备）；
+    3. 全部失败 → 抛 AllLLMUnavailable，由主流程触发紧急平仓。
+    """
 
     def __init__(
         self,
@@ -33,6 +44,9 @@ class LLMClient:
         temperature: float = 0.2,
         max_retries: int = 2,
         reasoning_effort: Optional[str] = None,
+        fallback: Optional["LLMClient"] = None,
+        confirm_attempts: Optional[int] = None,
+        confirm_interval: Optional[int] = None,
     ) -> None:
         self.api_key = api_key or config.llm_api_key
         self.base_url = base_url or config.llm_base_url or None
@@ -42,6 +56,12 @@ class LLMClient:
         # 推理强度三档（仿照 TradingAgents reasoning_effort）：low / medium / high，空=不设置
         effort = (reasoning_effort or config.llm_reasoning_effort).strip().lower()
         self.reasoning_effort = effort if effort in ("low", "medium", "high") else ""
+        # 备用 LLM 与连通性确认参数
+        self.fallback = fallback
+        self.confirm_attempts = confirm_attempts or config.llm_emergency_attempts
+        self.confirm_interval = (
+            confirm_interval if confirm_interval is not None else config.llm_emergency_interval
+        )
         if not self.api_key:
             raise LLMError("LLM_API_KEY 未配置")
         if not self.model:
@@ -58,9 +78,56 @@ class LLMClient:
     ) -> str:
         """发送对话，返回文本。
 
-        stream=True 时实时打印模型输出（便于观察模型回复/决策过程）。
-        json_mode=True 时要求模型输出合法 JSON。
+        主 LLM 优先；失败自动切备用；两者均失败则按间隔确认多次，
+        仍不可用则抛 AllLLMUnavailable（由主流程触发紧急平仓）。
         """
+        try:
+            return self._chat_impl(messages, temperature, json_mode, stream, label)
+        except LLMError as exc:
+            if self.fallback is not None:
+                try:
+                    logger.warning(
+                        "主 LLM(%s) 调用失败，切换到备用 LLM(%s): %s",
+                        self.model, self.fallback.model, exc,
+                    )
+                    return self.fallback._chat_impl(
+                        messages, temperature, json_mode, stream, label
+                    )
+                except LLMError as fb_exc:
+                    exc = fb_exc
+            # 主/备用均不可用 → 连通性确认
+            logger.error(
+                "主/备用 LLM 均调用失败，开始连通性确认（共 %d 次，每次间隔 %d 秒）",
+                self.confirm_attempts, self.confirm_interval,
+            )
+            clients = (self, self.fallback) if self.fallback is not None else (self,)
+            for i in range(self.confirm_attempts):
+                time.sleep(self.confirm_interval)
+                for client in clients:
+                    try:
+                        logger.warning(
+                            "连通性确认第 %d/%d 次：尝试 %s",
+                            i + 1, self.confirm_attempts, client.model,
+                        )
+                        return client._chat_impl(
+                            messages, temperature, json_mode, stream, label
+                        )
+                    except LLMError:
+                        continue
+            raise AllLLMUnavailable(
+                f"所有 LLM API 均无法正常通讯（已按 {self.confirm_interval}s 间隔"
+                f"尝试 {self.confirm_attempts} 次）: {exc}"
+            ) from exc
+
+    def _chat_impl(
+        self,
+        messages: list[dict],
+        temperature: Optional[float],
+        json_mode: bool,
+        stream: bool,
+        label: str,
+    ) -> str:
+        """单次调用实现（不含故障切换），供 chat() 与备用 LLM 复用。"""
         kwargs: dict[str, Any] = {
             "model": self.model,
             "messages": messages,

@@ -86,6 +86,57 @@ class OrderExecutor:
                 )
         return results
 
+    def flatten_all(self, account: AccountInfo, reason: str = "LLM API 全部不可用") -> list[dict]:
+        """紧急平仓：市价（reduceOnly）平掉账户全部持仓。
+
+        用于所有 LLM API 均无法通讯时的风险撤退；DRY_RUN 下只打印不真实下单。
+        """
+        results: list[dict] = []
+        for p in account.positions:
+            try:
+                side = "SELL" if p.position_amt > 0 else "BUY"
+                qty = self._quantity(
+                    self.client.get_symbol_info(p.symbol), abs(p.position_amt)
+                )
+                if qty <= 0:
+                    results.append({
+                        "symbol": p.symbol, "action": "EMERGENCY_FLATTEN",
+                        "status": "REJECTED", "error": "数量无效",
+                    })
+                    continue
+                if self.dry_run:
+                    logger.warning(
+                        "[DRY_RUN] 紧急平仓 %s %s qty=%s side=%s（%s）",
+                        p.symbol, p.position_amt, qty, side, reason,
+                    )
+                    results.append({
+                        "symbol": p.symbol, "action": "EMERGENCY_FLATTEN",
+                        "status": "DRY_RUN", "side": side, "quantity": qty,
+                        "reason": reason,
+                    })
+                    continue
+                order = self.client.close_position(
+                    symbol=p.symbol, side=side, quantity=qty
+                )
+                logger.warning(
+                    "紧急平仓 %s %s qty=%s side=%s -> %s（%s）",
+                    p.symbol, p.position_amt, qty, side, order.get("status"), reason,
+                )
+                results.append({
+                    "symbol": p.symbol, "action": "EMERGENCY_FLATTEN",
+                    "status": "CLOSED", "side": side, "quantity": qty, "order": order,
+                    "reason": reason,
+                })
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("紧急平仓失败 %s: %s", p.symbol, exc)
+                results.append({
+                    "symbol": p.symbol, "action": "EMERGENCY_FLATTEN",
+                    "status": "FAILED", "error": str(exc),
+                })
+        if not account.positions:
+            logger.info("紧急平仓：当前无持仓")
+        return results
+
     def _execute_one(self, ins: TradeInstruction, account: AccountInfo) -> dict:
         symbol_info = self.client.get_symbol_info(ins.symbol)
         mark_price = self.client.get_ticker_price(ins.symbol)
@@ -107,7 +158,129 @@ class OrderExecutor:
             return self._close(ins, pos, mark_price, base)
         if ins.action == OrderAction.FLATTEN:
             return self._flatten(ins, pos, mark_price, base)
+        if ins.action == OrderAction.CANCEL_ORDERS:
+            return self._cancel_orders(ins, base)
+        if ins.action == OrderAction.REPLACE_LIMIT:
+            return self._replace_limit(ins, symbol_info, base)
+        if ins.action == OrderAction.SET_SL_TP:
+            return self._set_sl_tp(ins, pos, symbol_info, base)
         raise ValueError(f"未知动作: {ins.action}")
+
+    def _cancel_orders(self, ins: TradeInstruction, base: dict) -> dict:
+        """撤销该币种全部未成交 LIMIT 挂单（不影响持仓的止盈止损保护单）。"""
+        if self.dry_run:
+            logger.info("[DRY_RUN] %s CANCEL_ORDERS（撤销全部未成交限价单）", ins.symbol)
+            base.update(status="DRY_RUN")
+            return base
+        try:
+            cancelled = self._cancel_pending_limits(ins.symbol)
+            logger.info("%s 已撤销限价挂单: %d 笔", ins.symbol, len(cancelled))
+            base.update(status="CANCELLED", cancelled_count=len(cancelled),
+                        cancelled_ids=cancelled)
+        except BinanceError as exc:
+            base.update(status="FAILED", error=str(exc))
+        return base
+
+    def _cancel_pending_limits(self, symbol: str) -> list[int]:
+        """撤销该币种全部未成交 LIMIT 挂单（保留 STOP/TP 保护单），返回 orderId 列表。"""
+        cancelled: list[int] = []
+        for order in self.client.get_open_orders(symbol):
+            if order.get("type") == "LIMIT":
+                self.client.cancel_order(symbol, order["orderId"])
+                cancelled.append(order["orderId"])
+        return cancelled
+
+    def _replace_limit(self, ins: TradeInstruction, symbol_info, base: dict) -> dict:
+        """更改挂单：先撤销该币种全部 LIMIT 挂单，再按新价格/数量重新挂 LIMIT 单。
+
+        仅撤销未成交的 LIMIT 单，保留持仓的止损/止盈保护单（STOP/TP）。
+        """
+        qty = self._quantity(symbol_info, ins.quantity or 0)
+        price = self._price(symbol_info, ins.price)
+        if qty <= 0:
+            base.update(status="REJECTED", error="数量无效")
+            return base
+        side = ins.side
+        if self.dry_run:
+            logger.info(
+                "[DRY_RUN] %s REPLACE_LIMIT：撤销全部挂单后挂 LIMIT %s qty=%s price=%s",
+                ins.symbol, side, qty, price,
+            )
+            base.update(status="DRY_RUN", side=side, quantity=qty,
+                        price=price, order_type="LIMIT")
+            return base
+        try:
+            cancelled = self._cancel_pending_limits(ins.symbol)
+            order = self.client.place_order(
+                symbol=ins.symbol,
+                side=side,
+                order_type="LIMIT",
+                quantity=qty,
+                price=price,
+                time_in_force="GTC",
+                client_order_id=self._client_order_id("rp"),
+            )
+            logger.info(
+                "%s 已改单：撤销 %d 笔 LIMIT 挂单并新挂 LIMIT %s qty=%s price=%s",
+                ins.symbol, len(cancelled), side, qty, price,
+            )
+            base.update(status="REPLACED", side=side, quantity=qty,
+                        price=price, order_type="LIMIT", order=order,
+                        cancelled_ids=cancelled)
+        except BinanceError as exc:
+            base.update(status="FAILED", error=str(exc))
+        return base
+
+    def _set_sl_tp(self, ins: TradeInstruction, pos, symbol_info, base: dict) -> dict:
+        """调整已持仓位的止盈/止损：先撤销旧保护单，再按新价重挂。
+
+        stop_loss / take_profit 至少提供一个（缺省的一项保留由新挂单处理）；
+        保护单按持仓全量（reduceOnly + 持仓数量）。
+        """
+        if pos is None:
+            base.update(status="REJECTED", error="无持仓，无法调整止盈止损")
+            return base
+        if ins.stop_loss is None and ins.take_profit is None:
+            base.update(status="REJECTED", error="stop_loss 与 take_profit 至少提供一个")
+            return base
+        protective_side = "SELL" if pos.position_amt > 0 else "BUY"
+        qty = self._quantity(symbol_info, abs(pos.position_amt))
+        if qty <= 0:
+            base.update(status="REJECTED", error="持仓数量无效")
+            return base
+
+        if self.dry_run:
+            logger.info(
+                "[DRY_RUN] %s SET_SL_TP：调整止盈止损 sl=%s tp=%s side=%s",
+                ins.symbol, ins.stop_loss, ins.take_profit, protective_side,
+            )
+            base.update(status="DRY_RUN", side=protective_side, quantity=qty,
+                        stop_loss=ins.stop_loss, take_profit=ins.take_profit)
+            return base
+
+        try:
+            cancelled = self._cancel_protective_orders(ins.symbol)
+            placed = self._place_stop_loss_take_profit(ins, qty, protective_side)
+            logger.info(
+                "%s 已调整止盈止损：撤销 %d 笔旧保护单，重挂 %d 笔（sl=%s tp=%s）",
+                ins.symbol, len(cancelled), len(placed),
+                ins.stop_loss, ins.take_profit,
+            )
+            base.update(status="ADJUSTED", side=protective_side, quantity=qty,
+                        cancelled_ids=cancelled, sl_tp_orders=placed,
+                        stop_loss=ins.stop_loss, take_profit=ins.take_profit)
+        except BinanceError as exc:
+            base.update(status="FAILED", error=str(exc))
+        return base
+
+    def _cancel_protective_orders(self, symbol: str) -> list[int]:
+        """撤销该币种全部未成交的止损/止盈保护单，返回被撤销的 orderId 列表。"""
+        cancelled: list[int] = []
+        for order in self.client.get_open_orders(symbol):
+            if order.get("type") in ("STOP_MARKET", "TAKE_PROFIT_MARKET"):
+                self.client.cancel_order(symbol, order["orderId"])
+                cancelled.append(order["orderId"])
+        return cancelled
 
     def _open(
         self, ins: TradeInstruction, symbol_info, mark_price: float, base: dict
@@ -169,16 +342,27 @@ class OrderExecutor:
             price=price,
             order_type=order_type,
         )
-        # 挂止损止盈（仅市价开仓成功后挂；限价单也可挂，但注意订单可能未成交）
+        # 挂止损止盈（LIMIT 单未成交时 reduceOnly 保护单可能被拒，降级不致命）
         if ins.stop_loss is not None or ins.take_profit is not None:
-            sl_tp = self._place_stop_loss_take_profit(ins, qty)
-            result["sl_tp_orders"] = sl_tp
+            try:
+                sl_tp = self._place_stop_loss_take_profit(ins, qty, side)
+                result["sl_tp_orders"] = sl_tp
+            except BinanceError as exc:
+                logger.warning(
+                    "%s 挂保护单失败（限价单可能未成交）: %s", ins.symbol, exc
+                )
+                result["sl_tp_error"] = str(exc)
         return result
 
-    def _place_stop_loss_take_profit(self, ins: TradeInstruction, qty: float) -> list[dict]:
-        """为仓位挂 STOP_MARKET / TAKE_PROFIT_MARKET 保护单。"""
+    def _place_stop_loss_take_profit(
+        self, ins: TradeInstruction, qty: float, protective_side: str
+    ) -> list[dict]:
+        """为仓位挂 STOP_MARKET / TAKE_PROFIT_MARKET 保护单。
+
+        protective_side：保护单方向（多头仓位→SELL 保护；空头仓位→BUY 保护）。
+        """
         placed = []
-        side = "SELL" if ins.action == OrderAction.OPEN_LONG else "BUY"
+        side = protective_side
         symbol_info = self.client.get_symbol_info(ins.symbol)
         if ins.stop_loss is not None:
             sl = self._price(symbol_info, ins.stop_loss)

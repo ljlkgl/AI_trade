@@ -16,12 +16,15 @@ from pydantic import BaseModel, Field, model_validator
 class OrderAction(str, Enum):
     """交易动作。"""
 
-    OPEN_LONG = "OPEN_LONG"      # 开多（买入开多仓）
-    OPEN_SHORT = "OPEN_SHORT"    # 开空（卖出开空仓）
-    CLOSE_LONG = "CLOSE_LONG"    # 平多（卖出平多仓）
-    CLOSE_SHORT = "CLOSE_SHORT"  # 平空（买入平空仓）
-    FLATTEN = "FLATTEN"          # 清仓该币种全部持仓
-    HOLD = "HOLD"                # 持有不动
+    OPEN_LONG = "OPEN_LONG"              # 开多（买入开多仓）
+    OPEN_SHORT = "OPEN_SHORT"            # 开空（卖出开空仓）
+    CLOSE_LONG = "CLOSE_LONG"            # 平多（卖出平多仓）
+    CLOSE_SHORT = "CLOSE_SHORT"          # 平空（买入平空仓）
+    FLATTEN = "FLATTEN"                  # 清仓该币种全部持仓
+    CANCEL_ORDERS = "CANCEL_ORDERS"      # 撤销该币种全部未成交挂单（限价单）
+    REPLACE_LIMIT = "REPLACE_LIMIT"      # 更改挂单：撤销原挂单，按新价格/数量重新挂限价单
+    SET_SL_TP = "SET_SL_TP"              # 调整已持仓位的止盈/止损（撤销旧保护单，按新价重挂）
+    HOLD = "HOLD"                        # 持有不动
 
 
 class OrderType(str, Enum):
@@ -59,6 +62,13 @@ class TradeInstruction(BaseModel):
         default=None, description="止盈价（触发后按市价平仓）"
     )
     reason: str = Field(description="该举措的理由，须引用具体指标或账户数据")
+    side: Optional[str] = Field(
+        default=None,
+        description=(
+            "挂单方向，仅 REPLACE_LIMIT（更改挂单）必填：BUY 挂买单 / SELL 挂卖单；"
+            "其它动作忽略该字段"
+        ),
+    )
 
     @model_validator(mode="after")
     def _require_stop_loss_on_open(self):
@@ -68,6 +78,52 @@ class TradeInstruction(BaseModel):
                 raise ValueError(
                     f"{self.symbol} {self.action} 必须设置 stop_loss（止损），止盈可选"
                 )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_order_management(self):
+        """挂单管理动作的必填字段校验。"""
+        if self.action == OrderAction.REPLACE_LIMIT:
+            if self.side not in ("BUY", "SELL"):
+                raise ValueError(
+                    f"{self.symbol} REPLACE_LIMIT 必须设置 side=BUY/SELL（挂单方向）"
+                )
+            if self.price is None or self.price <= 0:
+                raise ValueError(
+                    f"{self.symbol} REPLACE_LIMIT 必须设置 price>0（新挂单价）"
+                )
+            if self.quantity is None or self.quantity <= 0:
+                raise ValueError(
+                    f"{self.symbol} REPLACE_LIMIT 必须设置 quantity>0（新挂单数量）"
+                )
+        if self.action == OrderAction.SET_SL_TP:
+            if self.stop_loss is None and self.take_profit is None:
+                raise ValueError(
+                    f"{self.symbol} SET_SL_TP 必须提供 stop_loss 或 take_profit 至少一个"
+                )
+        return self
+
+
+class WakeCondition(BaseModel):
+    """条件唤醒（watch trigger）：价格触及阈值时唤醒系统提前分析。"""
+
+    symbol: str = Field(description="永续合约交易对，如 BTCUSDT")
+    condition: str = Field(
+        description="条件类型：price_above 价格≥value 时唤醒 / price_below 价格≤value 时唤醒"
+    )
+    value: float = Field(description="目标价格阈值")
+    note: str = Field(
+        default="", description="触发原因说明（为什么关注这个价位，供触发后的分析参考）"
+    )
+
+    @model_validator(mode="after")
+    def _validate(self):
+        if self.condition not in ("price_above", "price_below"):
+            raise ValueError(
+                f"condition 必须为 price_above 或 price_below，收到: {self.condition!r}"
+            )
+        if self.value <= 0:
+            raise ValueError(f"value 必须为正数，收到: {self.value}")
         return self
 
 
@@ -81,6 +137,13 @@ class TradingDecision(BaseModel):
         description="交易举措列表。每个币种至多一条指令；无操作则该币种为 HOLD"
     )
     risk_notes: str = Field(description="风险提示与仓位/止损管理说明")
+    watch_conditions: list[WakeCondition] = Field(
+        default_factory=list,
+        description=(
+            "唤醒条件列表：正常循环外，当任一条件满足时系统会提前唤醒执行一轮分析。"
+            "空列表=清除所有唤醒条件（不监控）；提供条件则全量替换上一轮的设置"
+        ),
+    )
 
 
 # 输出给模型的 JSON 示例，用于 few-shot 约束格式
@@ -97,10 +160,95 @@ DECISION_JSON_SCHEMA_HINT = """{
       "stop_loss": 94000,
       "take_profit": 100000,
       "reason": "MACD金叉且价格站上50SMA，趋势偏多"
+    },
+    {
+      "symbol": "BTCUSDT",
+      "action": "CANCEL_ORDERS",
+      "order_type": "LIMIT",
+      "price": null,
+      "quantity": null,
+      "leverage": null,
+      "stop_loss": null,
+      "take_profit": null,
+      "reason": "原限价挂单迟迟未成交，放弃该价位计划",
+      "side": null
+    },
+    {
+      "symbol": "ETHUSDT",
+      "action": "REPLACE_LIMIT",
+      "order_type": "LIMIT",
+      "price": 3450,
+      "quantity": 2.0,
+      "leverage": null,
+      "stop_loss": null,
+      "take_profit": null,
+      "reason": "原挂单价位未触及，下移限价到支撑位重新挂单",
+      "side": "BUY"
+    },
+    {
+      "symbol": "BTCUSDT",
+      "action": "SET_SL_TP",
+      "order_type": "MARKET",
+      "price": null,
+      "quantity": null,
+      "leverage": null,
+      "stop_loss": 96000,
+      "take_profit": 101000,
+      "reason": "行情已上移，止损止盈同步上移锁定利润",
+      "side": null
+    }
+  ],
+  "watch_conditions": [
+    {
+      "symbol": "BTCUSDT",
+      "condition": "price_above",
+      "value": 102000,
+      "note": "突破前高后准备追多，唤醒我复核"
+    },
+    {
+      "symbol": "BTCUSDT",
+      "condition": "price_below",
+      "value": 93000,
+      "note": "跌破关键支撑则风控收紧，唤醒我处理"
     }
   ],
   "risk_notes": "风险提示...（不涉及具体账户数字，只做风控说明）"
 }"""
+
+
+# ---------------------------------------------------------------------------
+# 执行前逐条确认（Confirmer）
+# ---------------------------------------------------------------------------
+
+
+class ConfirmationAction(str, Enum):
+    """执行前确认动作。"""
+
+    PROCEED = "PROCEED"   # 原指令合理，照常执行
+    SKIP = "SKIP"         # 指令有问题且无法可靠修正，跳过本指令
+    REPLACE = "REPLACE"   # 需要调整参数（如止损/数量/价格），给出修正后的完整指令
+
+
+class InstructionConfirmation(BaseModel):
+    """单条指令的执行前确认结果。"""
+
+    decision: ConfirmationAction = Field(
+        description="确认决定：PROCEED 照常执行 / SKIP 跳过 / REPLACE 用修正后的指令替换执行"
+    )
+    instruction: Optional[TradeInstruction] = Field(
+        default=None,
+        description=(
+            "REPLACE 时必须提供修正后的完整指令（与 TradingDecision 中相同的字段结构）；"
+            "PROCEED / SKIP 时忽略"
+        ),
+    )
+    reason: str = Field(description="确认判断理由，须引用当前价格/账户/指令的具体参数")
+
+    @model_validator(mode="after")
+    def _replace_requires_instruction(self):
+        if self.decision == ConfirmationAction.REPLACE and self.instruction is None:
+            raise ValueError("REPLACE 必须提供修正后的 instruction")
+        return self
 
 
 # ---------------------------------------------------------------------------
