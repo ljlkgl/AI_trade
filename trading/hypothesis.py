@@ -194,8 +194,9 @@ class ThesisStore:
 
         规则（按操作类型判断其操作周期是否已结束）：
         1. kind=position（持仓理由）：该币种已无任何持仓（仓位被完全平掉）→ 删除；
-        2. kind=limit_order（挂单理由）：该币种已无未成交 LIMIT 挂单
-           （挂单已成交/已撤销且未续挂）→ 删除；
+        2. kind=limit_order（挂单理由）：该币种已无未成交 LIMIT 挂单 且 无持仓
+           （挂单已撤销且不再续挂 / 挂单已成交并平仓）→ 删除；若已成交转持仓，
+           则保留待 _sync_theses 升级为 position 理由，避免误删有效条目；
         3. kind=other / 未知：无账户状态可核对，超时（超过 max_age_hours）→ 删除，
            防止上下文无限膨胀。
 
@@ -211,6 +212,9 @@ class ThesisStore:
                         return True
             return False
 
+        def _has_position(symbol: str) -> bool:
+            return symbol in account_positions
+
         stale_ids: set[str] = set()
         for r in self._data:
             symbol = r.get("symbol", "")
@@ -218,10 +222,13 @@ class ThesisStore:
             stale = False
 
             if kind == "position":
-                if symbol not in account_positions:
+                if not _has_position(symbol):
                     stale = True
             elif kind == "limit_order":
-                if not _has_open_limit(symbol):
+                # 挂单成交后该币种会以持仓形态存在（届时由 _sync_theses 升级为
+                # position 理由）。因此仅当「无未成交 LIMIT 且无持仓」时才判定过期，
+                # 避免挂单在两轮之间成交时误删本应升级的有效条目。
+                if not _has_open_limit(symbol) and not _has_position(symbol):
                     stale = True
             else:  # other / 未知
                 if self.max_age_hours:
