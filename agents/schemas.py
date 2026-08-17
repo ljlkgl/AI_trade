@@ -49,7 +49,8 @@ class TradeInstruction(BaseModel):
         default=None,
         description=(
             "标的币数量（如 BTC 数量）。开仓无需填写（系统按 margin×杠杆/价格自动换算）；"
-            "平仓可省略（缺省=全部平掉）；REPLACE_LIMIT 更改挂单必填"
+            "平仓可省略（缺省=全部平掉），也可填部分数量做部分平仓（如想平 50%，"
+            "quantity 填当前持仓数量的一半）；REPLACE_LIMIT 更改挂单必填"
         ),
     )
     margin: Optional[float] = Field(
@@ -69,7 +70,9 @@ class TradeInstruction(BaseModel):
     take_profit: Optional[float] = Field(
         default=None, description="止盈价（触发后按市价平仓）"
     )
-    reason: str = Field(description="该举措的理由，须引用具体指标或账户数据")
+    reason: str = Field(
+        description="该举措的详细理由，必须引用具体指标/价格/新闻事件时间/账户数据，说明依据与预期；不允许空泛理由",
+    )
     side: Optional[str] = Field(
         default=None,
         description=(
@@ -116,6 +119,18 @@ class TradeInstruction(BaseModel):
                 )
         return self
 
+    @model_validator(mode="after")
+    def _require_detailed_reason(self):
+        """每个操作都必须写入详细理由（引用具体依据），禁止空泛理由。"""
+        text = (self.reason or "").strip()
+        if len(text) < 10:
+            raise ValueError(
+                f"{self.symbol} {self.action.value} 的 reason（理由）过于简短（{len(text)} 字符），"
+                f"必须≥10 字符：详细说明依据（具体指标/价格/新闻事件时间/账户数据）与预期，"
+                f"不允许「看多」「止损了」这类空泛表述"
+            )
+        return self
+
 
 class WakeCondition(BaseModel):
     """条件唤醒（watch trigger）：价格触及阈值时唤醒系统提前分析。"""
@@ -140,6 +155,98 @@ class WakeCondition(BaseModel):
         return self
 
 
+class ThesisAction(str, Enum):
+    """操作理由（Thesis）列表操作动作。
+
+    模型拥有对「当前进行中的操作理由列表」的完整操作权：
+    - ADD      新增一条理由记录（开新仓 / 挂新单 / 启动某个操作时），可带 parent_id 挂到父编号下
+    - UPDATE   修改一条已有记录的字段（理由、备注、止盈止损、parent_id 等）
+    - COMPLETE 结束一条操作：将编号标注为完成记号，系统自动级联删除该编号
+               及其全部子编号关联的操作理由（如开仓=父编号、其止盈止损=各为子编号，
+               层级可两层以上）
+    - DELETE   删除一条记录（该操作周期已结束，如仓位被完全平掉 / 挂单撤销且不再续挂）
+    - NONE     不改动列表
+    """
+
+    ADD = "ADD"
+    UPDATE = "UPDATE"
+    COMPLETE = "COMPLETE"
+    DELETE = "DELETE"
+    NONE = "NONE"
+
+
+class ThesisOp(BaseModel):
+    """单条「操作理由列表」操作。
+
+    列表中的每条记录代表一个当前正在进行的操作（开仓 / 挂单 / 某个执行动作）
+    及其理由。当该操作周期结束（如仓位被完全平仓）时，对应记录应被删除。
+    模型拥有对列表的完整操作权；系统也会在平仓 / 撤单后自动清理过期条目，
+    防止上下文过大。
+    """
+
+    action: ThesisAction = Field(
+        description="列表操作：ADD 新增 / UPDATE 修改 / COMPLETE 结束（级联删除该编号及其子编号） / DELETE 删除 / NONE 不操作"
+    )
+    thesis_id: Optional[str] = Field(
+        default=None,
+        description="目标记录 id（系统在上下文中给出）。UPDATE / COMPLETE / DELETE 必填；ADD 时忽略（系统自动分配新 id）",
+    )
+    symbol: Optional[str] = Field(
+        default=None,
+        description="交易对，如 BTCUSDT；ADD 时必填，UPDATE/DELETE 时可选",
+    )
+    kind: Optional[str] = Field(
+        default="position",
+        description="操作类型：position 持仓 / limit_order 挂单 / other 其它操作；ADD 时可选，默认 position",
+    )
+    parent_id: Optional[str] = Field(
+        default=None,
+        description=(
+            "父编号 id，用于建立层级关系（如 开仓=父编号、其止盈止损=各为子编号，层级可两层以上）。"
+            "ADD 时可选：不填为顶层节点，填写后作为该父编号的子节点；"
+            "UPDATE 时可调整所属父编号。COMPLETE 一个父编号时，其全部子孙编号会被系统级联删除"
+        ),
+    )
+    direction: Optional[str] = Field(
+        default=None, description="方向 LONG / SHORT；持仓类 ADD 时建议填写"
+    )
+    entry_price: Optional[float] = Field(
+        default=None, description="开仓价 / 挂单价；ADD 时可选"
+    )
+    stop_loss: Optional[float] = Field(default=None, description="止损价；ADD 时可选")
+    take_profit: Optional[float] = Field(default=None, description="止盈价；ADD 时可选")
+    thesis: Optional[str] = Field(
+        default=None,
+        description="完整的操作理由 / 假设（为什么做这个操作、依据、预期）；ADD 时必填，UPDATE 时可更新",
+    )
+    note: Optional[str] = Field(
+        default=None,
+        description="备注（如：已实现部分止盈、行情是否仍符合预期、剩余利润空间判断等）；ADD/UPDATE 均可",
+    )
+
+    @model_validator(mode="after")
+    def _validate(self):
+        if self.action == ThesisAction.ADD:
+            if not self.thesis or not self.symbol:
+                raise ValueError("ADD 操作必须提供 symbol 与 thesis（操作理由）")
+            if len(self.thesis.strip()) < 10:
+                raise ValueError(
+                    "ADD 操作的 thesis（操作理由）过于简短，必须≥10 字符："
+                    "详细写明操作依据（具体指标/价格/新闻事件时间/账户数据）与预期"
+                )
+        if self.action in (
+            ThesisAction.UPDATE, ThesisAction.COMPLETE, ThesisAction.DELETE,
+        ) and not self.thesis_id:
+            raise ValueError(
+                f"{self.action.value} 操作必须提供 thesis_id（目标记录 id）"
+            )
+        if self.action == ThesisAction.COMPLETE and self.parent_id is not None:
+            raise ValueError(
+                "COMPLETE 操作不需要 parent_id（COMPLETE 父编号时系统自动级联删除其全部子孙编号）"
+            )
+        return self
+
+
 class TradingDecision(BaseModel):
     """模型输出的完整决策。"""
 
@@ -148,6 +255,17 @@ class TradingDecision(BaseModel):
     )
     instructions: list[TradeInstruction] = Field(
         description="交易举措列表。每个币种至多一条指令；无操作则该币种为 HOLD"
+    )
+    thesis_ops: list[ThesisOp] = Field(
+        default_factory=list,
+        description=(
+            "对「操作理由列表」的操作（可空）。你拥有该列表的完整操作权："
+            "ADD 新增当前进行中操作的理由（可带 parent_id 建立父子层级，如开仓=父、其止盈止损=子，"
+            "层级可两层以上）；UPDATE 更新理由/备注/parent_id；"
+            "COMPLETE 将某编号标注为完成记号，系统自动级联删除该编号及其全部子编号；"
+            "DELETE 删除单个编号。当某个操作周期结束（仓位被完全平掉 / 挂单撤销且不再续挂）时，"
+            "务必 COMPLETE 或 DELETE 对应条目；过期条目不及时清除会导致上下文过大。无需改动时给空列表"
+        ),
     )
     risk_notes: str = Field(description="风险提示与仓位/止损管理说明")
     watch_conditions: list[WakeCondition] = Field(
@@ -161,7 +279,11 @@ class TradingDecision(BaseModel):
 
 # 输出给模型的 JSON 示例，用于 few-shot 约束格式
 # 开仓（OPEN_LONG/OPEN_SHORT）只输出 margin（初始保证金 USDT），数量由系统自动换算；
-# 挂单管理（REPLACE_LIMIT/CANCEL_ORDERS/SET_SL_TP）与平仓才用到 quantity（币数量）。
+# 挂单管理（REPLACE_LIMIT/CANCEL_ORDERS/SET_SL_TP）与平仓才用到 quantity（币数量）；
+# 平仓可不填 quantity（缺省=全部平掉），也可填部分数量做部分平仓（如平 50%）。
+# thesis_ops 为对「操作理由列表」的操作（可空）：ADD 新增（可带 parent_id 建立父子层级，
+# 如开仓=父、其止盈止损=各为子编号，层级可两层以上）/ UPDATE 修改 / COMPLETE 结束（标注完成记号，
+# 系统自动级联删除该编号及其全部子编号）/ DELETE 删除单个编号。
 DECISION_JSON_SCHEMA_HINT = """{
   "market_assessment": "整体偏多/偏空/震荡的简短判断...",
   "instructions": [
@@ -205,6 +327,19 @@ DECISION_JSON_SCHEMA_HINT = """{
     },
     {
       "symbol": "BTCUSDT",
+      "action": "CLOSE_LONG",
+      "order_type": "MARKET",
+      "price": null,
+      "quantity": 0.05,
+      "margin": null,
+      "leverage": null,
+      "stop_loss": null,
+      "take_profit": null,
+      "reason": "已到止盈位，先平掉一半（0.05 BTC）落袋，剩余持仓继续持有",
+      "side": null
+    },
+    {
+      "symbol": "BTCUSDT",
       "action": "SET_SL_TP",
       "order_type": "MARKET",
       "price": null,
@@ -215,6 +350,60 @@ DECISION_JSON_SCHEMA_HINT = """{
       "take_profit": 101000,
       "reason": "行情已上移，止损止盈同步上移锁定利润",
       "side": null
+    }
+  ],
+  "thesis_ops": [
+    {
+      "action": "ADD",
+      "thesis_id": null,
+      "symbol": "BTCUSDT",
+      "kind": "position",
+      "parent_id": null,
+      "direction": "LONG",
+      "entry_price": 95000,
+      "stop_loss": 94000,
+      "take_profit": 100000,
+      "thesis": "ETF 资金持续流入+MACD金叉，回调后重启上行，先平一半后剩单持有",
+      "note": "已部分止盈 50%，剩余仓位继续持有，行情未偏离预期"
+    },
+    {
+      "action": "ADD",
+      "thesis_id": null,
+      "symbol": "BTCUSDT",
+      "kind": "other",
+      "parent_id": "th_20260817_....",
+      "direction": null,
+      "entry_price": null,
+      "stop_loss": 94000,
+      "take_profit": null,
+      "thesis": "止损保护子编号（挂在开仓父编号下，作为其子节点）",
+      "note": null
+    },
+    {
+      "action": "COMPLETE",
+      "thesis_id": "th_20260817_....",
+      "symbol": null,
+      "kind": null,
+      "parent_id": null,
+      "direction": null,
+      "entry_price": null,
+      "stop_loss": null,
+      "take_profit": null,
+      "thesis": null,
+      "note": null
+    },
+    {
+      "action": "DELETE",
+      "thesis_id": "th_20260817_....",
+      "symbol": null,
+      "kind": null,
+      "parent_id": null,
+      "direction": null,
+      "entry_price": null,
+      "stop_loss": null,
+      "take_profit": null,
+      "thesis": null,
+      "note": null
     }
   ],
   "watch_conditions": [
@@ -261,12 +450,20 @@ class InstructionConfirmation(BaseModel):
             "PROCEED / SKIP 时忽略"
         ),
     )
-    reason: str = Field(description="确认判断理由，须引用当前价格/账户/指令的具体参数")
+    reason: str = Field(
+        description="确认判断理由，须引用当前价格/账户/指令的具体参数，禁止空泛理由"
+    )
 
     @model_validator(mode="after")
     def _replace_requires_instruction(self):
         if self.decision == ConfirmationAction.REPLACE and self.instruction is None:
             raise ValueError("REPLACE 必须提供修正后的 instruction")
+        text = (self.reason or "").strip()
+        if len(text) < 10:
+            raise ValueError(
+                f"确认理由过于简短（{len(text)} 字符），必须≥10 字符："
+                "引用当前价格/账户/指令具体参数说明判断依据"
+            )
         return self
 
 

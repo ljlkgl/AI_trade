@@ -245,15 +245,18 @@ class BinanceClient:
         place_algo_order()（/fapi/v1/algoOrder），本方法仅用于 MARKET/LIMIT。
 
         position_side：双向持仓模式(Hedge Mode)下必填 LONG/SHORT；单向模式为 None。
+        双向模式下禁止传 reduceOnly（用 positionSide 指定方向）；因此仅在
+        单向模式且 reduce_only=True 时才发送 reduceOnly=true。
         """
         params: dict[str, Any] = {
             "symbol": symbol,
             "side": side,
             "type": order_type,
             "quantity": quantity,
-            "reduceOnly": "true" if reduce_only else "false",
             "newOrderRespType": "RESULT",
         }
+        if reduce_only and not position_side:
+            params["reduceOnly"] = "true"
         if price is not None:
             params["price"] = price
         if stop_price is not None:

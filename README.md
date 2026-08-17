@@ -52,7 +52,7 @@ trade_tool/
     ├── indicators.py        # 技术指标计算（TradingAgents 指标体系）
     ├── market.py            # 行情数据服务
     ├── news.py              # 新闻服务（yfinance，提取自 TradingAgents）
-    ├── hypothesis.py        # 持仓假设存储 + 偏离检查上下文
+    ├── hypothesis.py        # 操作理由列表存储（ThesisStore：增删改查 + 父子层级 + COMPLETE 级联清理）
     ├── experience.py        # 自主经验库（写入/修改/删除/参考）
     ├── risk.py              # 风控校验（含止损强制、保证金下限）
     ├── executor.py          # 订单执行器
@@ -249,7 +249,7 @@ python main.py --interval 60
 | stockstats 指标（SMA/MACD/RSI/BOLL/ATR/VWMA/MFI） | `indicators.py`（纯 pandas 实现，同名指标） |
 | TraderProposal（action/reasoning/entry/stop_loss/sizing） | `TradeInstruction`（动作/理由/价格/数量/杠杆/止损止盈，开仓强制止损） |
 | Portfolio Manager + 账户上下文 | `DecisionMaker`（注入账户现状 + 假设检查后结构化决策） |
-| TradingMemoryLog（决策复盘记忆） | `HypothesisStore`（开仓理由记录 + 偏离检查） |
+| TradingMemoryLog（决策复盘记忆） | `ThesisStore`（操作理由列表 + 父子层级编号 + COMPLETE 级联删除 + 自动清理） |
 | Reflector（回测结果反思） | `Reflector` + `ExperienceStore`（每轮自我反省 + 自主经验库） |
 | 风控约束 | `RiskManager` 硬校验层 |
 

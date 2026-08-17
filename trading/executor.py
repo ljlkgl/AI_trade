@@ -385,10 +385,13 @@ class OrderExecutor:
             notional=notional,
         )
         # 挂止损止盈（LIMIT 单未成交时 reduceOnly 保护单可能被拒，降级不致命）
+        # 保护单必须用「平仓方向」：多头→SELL、空头→BUY；若误用开仓方向（多头=BUY），
+        # 触发价会相对现价立即触发（Order would immediately trigger）而被交易所拒绝
         if ins.stop_loss is not None or ins.take_profit is not None:
+            protective_side = "SELL" if ins.action == OrderAction.OPEN_LONG else "BUY"
             try:
                 sl_tp = self._place_stop_loss_take_profit(
-                    ins, qty, side,
+                    ins, qty, protective_side,
                     protective_position_side=self._ps(
                         "LONG" if ins.action == OrderAction.OPEN_LONG else "SHORT"
                     ),

@@ -20,6 +20,88 @@ from trading.types import AccountInfo, Position, SymbolInfo
 logger = logging.getLogger(__name__)
 
 
+def ceil_to_step(value: float, step: float) -> float:
+    """按 stepSize 向上取整（保证不小于原始值，用于最小下单量换算）。"""
+    if step <= 0:
+        return value
+    n = int(-(-value // step))
+    return n * step
+
+
+def min_margin_for(
+    symbol_info: SymbolInfo,
+    price: float,
+    leverage: int,
+    min_margin_cfg: Optional[float] = None,
+    min_notional_cfg: Optional[float] = None,
+) -> float:
+    """计算给定杠杆下，某交易品种的最少初始保证金（USDT）。
+
+    名义价值 = 初始保证金 × 杠杆；因此 最少初始保证金 = 最少名义价值 / 杠杆。
+    最少名义价值取以下口径的最大值：
+    1. 系统单笔名义价值下限 min_notional_cfg（默认 config.min_notional）；
+    2. 交易所 MIN_NOTIONAL 下限（symbol_info.min_notional）；
+    3. 交易所最小下单量约束：数量 = 名义/价格 ≥ minQty，
+       即 名义 ≥ ceil(minQty/step)*step*price（按 qty_step 向上取整）。
+    再与系统单笔保证金下限 min_margin_cfg 取最大（保证金本身不能低于系统下限）。
+    """
+    min_notional_cfg = min_notional_cfg if min_notional_cfg is not None else config.min_notional
+    min_margin_cfg = min_margin_cfg if min_margin_cfg is not None else config.min_margin
+    if leverage <= 0 or price <= 0:
+        return min_margin_cfg
+
+    # 交易所最小下单量对应的名义价值
+    qty_min = ceil_to_step(symbol_info.min_qty, symbol_info.qty_step)
+    notional_from_qty = qty_min * price
+
+    min_notional = max(
+        min_notional_cfg,
+        symbol_info.min_notional,
+        notional_from_qty,
+    )
+    margin = max(min_notional / leverage, min_margin_cfg)
+    return float(margin)
+
+
+def build_min_margin_context(
+    symbols: list[str],
+    symbol_info_map: dict[str, SymbolInfo],
+    price_map: dict[str, float],
+    max_leverage: int = 20,
+    min_margin_cfg: Optional[float] = None,
+    min_notional_cfg: Optional[float] = None,
+) -> str:
+    """构建「各品种在不同杠杆下的最少初始保证金」上下文，供决策者参考。
+
+    输出的核心信息：你给出的开仓 margin 必须 ≥ 对应杠杆下的最少初始保证金，
+    否则换算出的下单数量可能低于交易所最小下单量而被拦截。
+    """
+    leverages = sorted({1, 5, 10, 15, max(15, max_leverage)})
+    lines = [
+        "# 各品种最少初始保证金（按杠杆）",
+        "- 规则：最少初始保证金 = 最少名义价值 / 杠杆；最少名义价值取以下最大值：",
+        f"  系统下限 {min_notional_cfg or config.min_notional:.0f} USDT、"
+        f"交易所 MIN_NOTIONAL、以及 交易所最小下单量×当前价（按最小步长向上取整）",
+        f"- 同时单笔保证金不能低于系统下限 {min_margin_cfg or config.min_margin:.2f} USDT",
+        "- 你输出的 margin 必须 ≥ 当前杠杆对应的最少初始保证金，否则下单会被系统拦截",
+        "",
+        "| 品种 | 现价 | " + " | ".join(f"{l}x" for l in leverages) + " |",
+        "|---|--|" + "---|" * len(leverages),
+    ]
+    for sym in symbols:
+        info = symbol_info_map.get(sym)
+        price = price_map.get(sym, 0)
+        if info is None or price <= 0:
+            lines.append(f"| {sym} | 无价格/精度 | - |")
+            continue
+        cells = [
+            f"{min_margin_for(info, price, l, min_margin_cfg, min_notional_cfg):.2f}"
+            for l in leverages
+        ]
+        lines.append(f"| {sym} | {price:.6g} | " + " | ".join(cells) + " |")
+    return "\n".join(lines)
+
+
 @dataclass
 class RiskCheckResult:
     ok: bool
@@ -122,10 +204,13 @@ class RiskManager:
                 )
             else:
                 notional = margin * lev
-                if notional < self.min_notional:
+                # 名义价值下限 = 系统下限 与 交易所 MIN_NOTIONAL 的较大值（二者都需满足）
+                min_notional = max(self.min_notional, symbol_info.min_notional)
+                if notional < min_notional:
                     errors.append(
                         f"{instruction.symbol}: 单笔名义价值 {notional:.2f} "
-                        f"低于最小限制 {self.min_notional:.2f} USDT（名义价值=保证金×杠杆）"
+                        f"低于最小限制 {min_notional:.2f} USDT"
+                        f"（名义价值=保证金×杠杆，含交易所 MIN_NOTIONAL {symbol_info.min_notional:.2f}）"
                     )
                 if margin < self.min_margin:
                     errors.append(

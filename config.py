@@ -84,6 +84,8 @@ class Config:
         self.watch_enabled = _get_bool("WATCH_ENABLED", True)
         self.watch_check_interval = _get_int("WATCH_CHECK_INTERVAL", 30)  # 秒
         self.watch_max_age_hours = _get_int("WATCH_MAX_AGE_HOURS", 24)  # 小时
+        # 操作理由列表中「其它类」条目的超时过期时长（小时），防止上下文无限膨胀
+        self.thesis_max_age_hours = _get_int("THESIS_MAX_AGE_HOURS", 72)
 
     def validate(self) -> None:
         """启动前校验关键配置，缺失时给出明确错误。"""

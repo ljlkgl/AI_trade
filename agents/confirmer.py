@@ -35,9 +35,14 @@ Rules:
 - Do NOT modify instructions without a concrete reason tied to the data you see (price/account).
   When in doubt, PROCEED.
 - For any OPEN action keep the hard constraints: margin>0 (initial margin in USDT) AND
-  margin ≤ available_balance (see account snapshot), leverage within cap,
+  margin ≤ available_balance (see account snapshot) AND margin ≥ the minimum initial margin
+  for the chosen leverage (see "各品种最少初始保证金" table if provided), leverage within cap,
   stop_loss mandatory & on the correct side (LONG: sl < price < tp; SHORT: sl > price > tp).
   For OPEN, quantity is derived by the system (quantity = margin × leverage / price), do NOT edit it.
+- For CLOSE_LONG/CLOSE_SHORT (partial close allowed): if quantity is given it must be positive and
+  must NOT exceed the current position size shown in the account snapshot; a quantity strictly smaller
+  than the position means a PARTIAL close (e.g. close 50% = half the position). If quantity is omitted
+  the whole position will be closed. Do NOT reject a CLOSE merely because it is partial.
 - For REPLACE_LIMIT keep quantity>0 (coin quantity) and a valid LIMIT price.
 - For REPLACE you MUST output the full corrected instruction JSON (including margin for OPEN).
 

@@ -6,13 +6,15 @@
   python main.py --interval 30   # 覆盖轮询间隔（分钟）
 
 每一轮流程（顺序固定）：
-1. 最先获取账户现状（余额/持仓/未实现盈亏）
-2. 若账户无任何持仓 → 从零分析（不携带历史假设）；否则加载持仓假设检查上下文
-3. 拉取行情 + 指标 + 新闻 → 市场分析师报告
-4. 决策者（接收市场报告 + 新闻 + 假设检查 + 经验库 + 账户现状）→ 结构化举措
-5. 风控校验 → 执行
-6. 若发生开仓/调仓：将完整理由记录到假设存储，供下一轮检查行情是否偏离
-7. 反思者复盘本轮结果，自主写入/修改/删除经验库条目，供以后参考
+1. 最先获取账户现状（余额/持仓/未实现盈亏）+ 未成交挂单（普通订单 + 算法条件单）
+2. 提前取价与精度 → 构建「各品种最少初始保证金」上下文
+3. 操作理由列表：自动清理过期条目（仓位完全平掉 / 挂单撤销且不再续挂），
+   渲染当前进行中操作的理由列表
+4. 拉取行情 + 指标 + 新闻 → 市场分析师报告
+5. 决策者（接收市场报告 + 新闻 + 理由列表 + 最少保证金 + 经验库 + 账户现状）→ 结构化举措
+6. 风控校验 → 逐条确认 → 执行
+7. 应用模型对理由列表的操作（thesis_ops：ADD/UPDATE/DELETE）+ 自动同步补录/清理
+8. 反思者复盘本轮结果，自主写入/修改/删除经验库条目，供以后参考
 """
 from __future__ import annotations
 
@@ -28,15 +30,15 @@ from agents.decision_maker import DecisionMaker, format_account_context
 from agents.llm import AllLLMUnavailable, LLMClient
 from agents.market_analyst import MarketAnalyst
 from agents.reflector import Reflector
-from agents.schemas import ConfirmationAction, ExperienceAction
+from agents.schemas import ConfirmationAction, ExperienceAction, ThesisAction
 from config import config
 from trading.binance_client import BinanceClient
 from trading.experience import ExperienceStore
 from trading.executor import OrderExecutor
-from trading.hypothesis import HypothesisStore, build_hypothesis_check_context
+from trading.hypothesis import ThesisStore
 from trading.market import MarketDataService
 from trading.news import NewsService
-from trading.risk import RiskManager
+from trading.risk import RiskManager, build_min_margin_context
 from trading.watch import WatchStore
 
 logging.basicConfig(
@@ -130,7 +132,7 @@ class TradingSystem:
         self.executor = OrderExecutor(
             self.client, self.risk, hedge_mode=self.hedge_mode
         )
-        self.hypotheses = HypothesisStore()
+        self.theses = ThesisStore(max_age_hours=config.thesis_max_age_hours)
         self.experiences = ExperienceStore()
         self.watch_store = WatchStore(max_age_hours=config.watch_max_age_hours)
         self.symbols = config.symbols
@@ -216,18 +218,34 @@ class TradingSystem:
             for sym, orders in open_orders_by_symbol.items()
         }
 
-        # 2. 假设检查上下文：无仓位则从零分析，并清理失效假设
-        account_positions = {p.symbol: p for p in account.positions}
+        # 2. 提前取价与精度（构建「最少初始保证金」上下文；后续风控校验复用）
+        price_map: dict[str, float] = {}
+        symbol_info_map = {}
         for sym in self.symbols:
-            if sym not in account_positions and self.hypotheses.get(sym):
-                logger.info("%s 已无持仓，清除历史假设（从零分析）", sym)
-                self.hypotheses.remove(sym)
-        hypothesis_context = build_hypothesis_check_context(
-            self.hypotheses, account_positions
+            try:
+                price_map[sym] = self.client.get_ticker_price(sym)
+                symbol_info_map[sym] = self.client.get_symbol_info(sym)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("获取 %s 价格/精度失败: %s", sym, exc)
+        min_margin_context = build_min_margin_context(
+            self.symbols, symbol_info_map, price_map, config.max_leverage
         )
-        result["hypothesis_context"] = hypothesis_context
+        result["min_margin_context"] = min_margin_context
 
-        # 3. 市场上下文（多币种多周期）+ 新闻
+        # 3. 操作理由列表：先自动清理过期条目（仓位已完全平掉 / 挂单撤销且不再续挂），
+        #    再渲染当前进行中操作的理由列表，供决策者读取与操作（thesis_ops）
+        account_positions = {p.symbol: p for p in account.positions}
+        if not config.dry_run:
+            try:
+                pruned = self.theses.prune_stale(account_positions, open_orders_by_symbol)
+                if pruned:
+                    logger.info("操作理由列表已自动清理 %d 条过期条目", pruned)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("操作理由列表清理失败: %s", exc)
+        thesis_context = self.theses.render_context()
+        result["thesis_context"] = thesis_context
+
+        # 4. 市场上下文（多币种多周期）+ 新闻
         try:
             market_context = self.market_data.build_market_context_for_symbols(
                 self.symbols, limit=config.klines_limit
@@ -245,7 +263,7 @@ class TradingSystem:
             news_context = "（新闻获取失败，本轮忽略新闻面）"
         result["news_context_len"] = len(news_context)
 
-        # 4. 市场分析师产出报告（技术 + 新闻）
+        # 5. 市场分析师产出报告（技术 + 新闻）
         try:
             market_report = self.market_analyst.analyze(market_context, news_context)
             logger.info("市场分析报告已生成（%d 字符）", len(market_report))
@@ -257,17 +275,19 @@ class TradingSystem:
             return result
         result["market_report"] = market_report
 
-        # 5. 决策者输出结构化举措（含账户现状 + 假设检查 + 经验库）
+        # 6. 决策者输出结构化举措（含账户现状 + 操作理由列表 + 最少保证金 + 经验库）
         try:
             experience_context = self.experiences.format_for_context()
             decision = self.decision_maker.decide(
-                market_report, news_context, hypothesis_context, account,
+                market_report, news_context, thesis_context, account,
                 experience_context=experience_context,
                 open_orders_by_symbol=open_orders_by_symbol,
+                min_margin_context=min_margin_context,
             )
             logger.info(
-                "决策: %d 条指令, 评估=%s",
+                "决策: %d 条指令, %d 条理由操作, 评估=%s",
                 len(decision.instructions),
+                len(decision.thesis_ops),
                 decision.market_assessment[:120],
             )
         except AllLLMUnavailable as exc:
@@ -278,7 +298,8 @@ class TradingSystem:
             return result
         result["market_assessment"] = decision.market_assessment
         result["risk_notes"] = decision.risk_notes
-        # 5.5 更新唤醒条件（模型可在正常循环外设定价格触发，全量替换）
+        result["thesis_ops"] = [op.model_dump() for op in decision.thesis_ops]
+        # 7. 更新唤醒条件（模型可在正常循环外设定价格触发，全量替换）
         result["watch_conditions"] = [
             c.model_dump() for c in decision.watch_conditions
         ]
@@ -287,16 +308,7 @@ class TradingSystem:
         except Exception as exc:  # noqa: BLE001
             logger.warning("更新唤醒条件失败: %s", exc)
 
-        # 6. 风控校验
-        price_map: dict[str, float] = {}
-        symbol_info_map = {}
-        for sym in self.symbols:
-            try:
-                price_map[sym] = self.client.get_ticker_price(sym)
-                symbol_info_map[sym] = self.client.get_symbol_info(sym)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("获取 %s 价格/精度失败: %s", sym, exc)
-
+        # 8. 风控校验（价格/精度已在第 2 步获取，此处复用）
         passed, risk_results = self.risk.validate_decision(
             decision.instructions, account, price_map, symbol_info_map
         )
@@ -315,7 +327,7 @@ class TradingSystem:
             for i in passed
         ]
 
-        # 7. 逐条确认后执行：每条指令执行前调用确认者复核，
+        # 9. 逐条确认后执行：每条指令执行前调用确认者复核，
         #    确认过程中模型可 PROCEED / SKIP / REPLACE（输出修正后的新指令）
         exec_results: list[dict] = []
         executed_instructions: list = []  # 实际执行的指令（含 REPLACE 修正后）
@@ -415,14 +427,21 @@ class TradingSystem:
             logger.info("无通过风控的指令，本轮不交易")
         result["execution"] = exec_results
 
-        # 8. 记录开仓/调仓理由到假设存储（供下一轮检查行情是否偏离）
-        self._record_hypotheses(
-            executed_instructions, exec_results, account, decision, price_map
-        )
+        # 10. 应用模型对「操作理由列表」的操作（模型拥有完整操作权：ADD/UPDATE/DELETE），
+        #     并同步列表：为新开仓/新挂单补录理由、按真实账户清理过期条目
+        try:
+            self._apply_thesis_ops(decision.thesis_ops)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("应用理由列表操作失败: %s", exc)
+        try:
+            self._sync_theses(executed_instructions, exec_results, account, price_map)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("同步操作理由列表失败: %s", exc)
+        result["thesis_count"] = self.theses.count()
 
-        # 9. 反思者复盘本轮，自主维护经验库（写入/修改/删除）
+        # 11. 反思者复盘本轮，自主维护经验库（写入/修改/删除）
         self._reflect_and_apply(
-            decision, exec_results, account, hypothesis_context, market_report,
+            decision, exec_results, account, thesis_context, market_report,
             open_orders_by_symbol=open_orders_by_symbol,
         )
         if self._last_reflection:
@@ -466,17 +485,15 @@ class TradingSystem:
         decision,
         exec_results: list[dict],
         account,
-        hypothesis_context: str,
+        thesis_context: str,
         market_report: str,
         open_orders_by_symbol: dict | None = None,
     ) -> None:
         """运行反思者并应用经验库操作。"""
-        from trading.hypothesis import build_hypothesis_check_context
-
         # 反思执行结果，失败/降级不阻断主流程
         try:
             account_positions = {p.symbol: p for p in account.positions}
-            prev_ctx = build_hypothesis_check_context(self.hypotheses, account_positions)
+            prev_ctx = self.theses.render_drift_check(account_positions)
             decision_summary = json.dumps({
                 "market_assessment": decision.market_assessment,
                 "instructions": [
@@ -542,55 +559,114 @@ class TradingSystem:
         except Exception as exc:  # noqa: BLE001
             logger.error("应用经验库操作失败 %s: %s", action, exc)
 
-    def _record_hypotheses(
+    def _apply_thesis_ops(self, ops) -> None:
+        """应用模型对「操作理由列表」的操作（模型拥有完整操作权：ADD/UPDATE/DELETE）。"""
+        for op in ops:
+            try:
+                if op.action == ThesisAction.ADD:
+                    self.theses.add(
+                        symbol=op.symbol,
+                        kind=op.kind or "position",
+                        direction=op.direction,
+                        entry_price=op.entry_price,
+                        stop_loss=op.stop_loss,
+                        take_profit=op.take_profit,
+                        thesis=op.thesis,
+                        note=op.note,
+                    )
+                elif op.action == ThesisAction.UPDATE:
+                    fields = {
+                        k: v for k, v in {
+                            "kind": op.kind, "direction": op.direction,
+                            "entry_price": op.entry_price, "stop_loss": op.stop_loss,
+                            "take_profit": op.take_profit, "thesis": op.thesis,
+                            "note": op.note,
+                        }.items() if v is not None
+                    }
+                    if not self.theses.update(op.thesis_id, **fields):
+                        logger.warning("理由列表 UPDATE 失败: id=%s 不存在", op.thesis_id)
+                elif op.action == ThesisAction.COMPLETE:
+                    # 结束该操作：标注完成记号，系统自动级联删除该编号及其全部子编号的理由
+                    if not self.theses.complete(op.thesis_id):
+                        logger.warning("理由列表 COMPLETE 失败: id=%s 不存在", op.thesis_id)
+                elif op.action == ThesisAction.DELETE:
+                    if not self.theses.remove(op.thesis_id):
+                        logger.warning("理由列表 DELETE 失败: id=%s 不存在", op.thesis_id)
+                elif op.action == ThesisAction.NONE:
+                    pass
+                else:
+                    logger.warning("未知理由列表操作: %s", op.action)
+            except Exception as exc:  # noqa: BLE001
+                logger.error("应用理由列表操作失败 %s: %s", op.action, exc)
+
+    def _sync_theses(
         self,
         passed: list,
         exec_results: list[dict],
         account,
-        decision,
         price_map: dict[str, float],
     ) -> None:
-        """记录开仓/调仓假设；清仓/平仓的币种清除假设。"""
-        # 先处理：已被平仓/清仓的币种 → 清除假设
-        closed_symbols = {
-            r["symbol"]
-            for r in exec_results
-            if r.get("status") in ("CLOSED", "DRY_RUN")
-            and r.get("action") in ("CLOSE_LONG", "CLOSE_SHORT", "FLATTEN")
-        }
-        # DRY_RUN 下平仓不算真实清除；真实平仓才清。DRY_RUN 保守不清除。
-        if not config.dry_run:
-            for sym in closed_symbols:
-                self.hypotheses.remove(sym)
+        """执行后同步操作理由列表。
 
-        # 记录开仓/调仓
+        1. 自动补录：本轮成功执行的开仓/挂单，若该币种尚无理由记录则补一条
+           （限价开仓记为 limit_order 理由，市价开仓记为 position 理由）；
+        2. 真实模式下：挂单成交后自动将 limit_order 理由升级为 position 理由，
+           并按真实账户状态清理过期条目（仓位完全平掉 / 挂单撤销且不再续挂）。
+        """
+        # 1. 自动补录
         instruction_map = {i.symbol: i for i in passed}
         for r in exec_results:
             symbol = r.get("symbol")
             ins = instruction_map.get(symbol)
             if ins is None:
                 continue
-            action = r.get("action")
-            # 仅记录真正执行的 OPEN（DRY_RUN 演练 / OPENED 成交），失败/跳过不写假设
-            if action in ("OPEN_LONG", "OPEN_SHORT") and r.get("status") in ("DRY_RUN", "OPENED"):
-                pos_side = "LONG" if action == "OPEN_LONG" else "SHORT"
-                entry = ins.price or price_map.get(symbol, 0)
-                lev = ins.leverage or 1
-                margin = ins.margin or 0
-                qty = (margin * lev / entry) if (margin > 0 and entry > 0) else 0
-                self.hypotheses.set(symbol, {
-                    "side": pos_side,
-                    "entry_price": entry,
-                    "quantity": qty,
-                    "margin": margin,
-                    "leverage": ins.leverage,
-                    "stop_loss": ins.stop_loss,
-                    "take_profit": ins.take_profit,
-                    "opened_at": datetime.now().isoformat(),
-                    "rationale": ins.reason,
-                    "assumptions": ins.reason,
-                })
-                logger.info("已记录 %s 开仓假设: %s", symbol, ins.reason[:100])
+            if r.get("action") not in ("OPEN_LONG", "OPEN_SHORT"):
+                continue
+            if r.get("status") not in ("DRY_RUN", "OPENED"):
+                continue
+            # 该币种已有理由记录（可能由模型 thesis_ops ADD 过），不重复补录
+            if self.theses.by_symbol(symbol):
+                continue
+            direction = "LONG" if r.get("action") == "OPEN_LONG" else "SHORT"
+            is_limit = r.get("order_type") == "LIMIT"
+            entry = ins.price or price_map.get(symbol, 0)
+            self.theses.add(
+                symbol=symbol,
+                kind="limit_order" if is_limit else "position",
+                direction=direction,
+                entry_price=entry,
+                stop_loss=ins.stop_loss,
+                take_profit=ins.take_profit,
+                thesis=ins.reason,
+            )
+            logger.info("已为 %s %s 自动补录操作理由", symbol, "挂单" if is_limit else "开仓")
+
+        # 2. 真实模式：挂单成交→升级为持仓理由；并按真实账户清理过期条目
+        #    注意：此处必须重新获取最新账户（而非执行前快照），否则刚开仓的仓位
+        #    在 account 中看不到，导致 prune_stale 误判「仓位已平」而立即删除
+        if not config.dry_run:
+            try:
+                fresh_account = self.client.get_account()
+                account_positions = {p.symbol: p for p in fresh_account.positions}
+            except Exception:
+                account_positions = {p.symbol: p for p in account.positions}
+            for th in self.theses.all():
+                if th.get("kind") == "limit_order" and th.get("symbol") in account_positions:
+                    pos = account_positions[th["symbol"]]
+                    self.theses.update(
+                        th["id"], kind="position",
+                        direction="LONG" if pos.position_amt > 0 else "SHORT",
+                        entry_price=pos.entry_price,
+                    )
+            try:
+                open_orders_by_symbol = {
+                    sym: _merge_open_orders(sym, self.client) for sym in self.symbols
+                }
+            except Exception:  # noqa: BLE001
+                open_orders_by_symbol = {}
+            removed = self.theses.prune_stale(account_positions, open_orders_by_symbol)
+            if removed:
+                logger.info("操作理由列表自动清理 %d 条过期条目", removed)
 
     def run_loop(self) -> None:
         """循环模式：每 interval 分钟执行一轮；若模型设定唤醒条件，条件满足时提前执行。"""

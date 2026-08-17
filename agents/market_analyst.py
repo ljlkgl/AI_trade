@@ -21,10 +21,16 @@ Write a detailed, nuanced market analysis report covering:
 2. Momentum: MACD (cross, histogram), RSI (overbought/oversold), MFI (money flow).
 3. Volatility: Bollinger bands (position vs bands, squeeze/expansion), ATR magnitude.
 4. Volume confirmation: VWMA relationship with price.
-5. News catalysts: which news supports or threatens each asset; filter noise, keep signal.
-6. Key levels: recent support/resistance, Bollinger boundaries.
-7. For each asset, a clear directional bias: LONG / SHORT / NEUTRAL, with a confidence level (high/medium/low) and the main reason.
-8. Cross-asset relative strength: which of BTC/ETH/SOL looks strongest/weakest.
+5. News catalysts: For each news item, explicitly state:
+   - Event time (when the event happened or was published, e.g., "2026-08-16 09:30 UTC")
+   - Impact direction (BULLISH / BEARISH / NEUTRAL) — state which asset it affects and why
+   - Price-in assessment: Is this event already fully reflected in the current price? Choose one of:
+     "Not priced in" / "Partially priced in" / "Fully priced in"
+   - Remaining profit potential: If not fully priced in, estimate the remaining upside or downside
+     space (e.g., "1-2% upside remaining", "0.5-1% downside still to materialize").
+   - If the news is noise or too old to matter, say so explicitly. Do NOT invent impact where none exists.
+6. For each asset, a clear directional bias: LONG / SHORT / NEUTRAL, with a confidence level (high/medium/low) and the main reason.
+7. Cross-asset relative strength: which of BTC/ETH/SOL looks strongest/weakest and why.
 
 Be specific and cite actual indicator values and news headlines. Do NOT invent data not present.
 End with a concise markdown table summarizing per-asset bias and key signals.
@@ -38,7 +44,11 @@ class MarketAnalyst:
         self.llm = llm
 
     def analyze(self, market_context: str, news_context: str = "") -> str:
+        from datetime import datetime, timezone
+
+        now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
         user_parts = [
+            f"当前时间（UTC）：{now_utc}\n\n",
             "以下是 BTC/ETH/SOL 永续合约的多周期技术指标快照，请基于此输出分析报告：\n\n",
             market_context,
         ]
