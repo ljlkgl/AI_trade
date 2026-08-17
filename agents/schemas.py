@@ -48,8 +48,16 @@ class TradeInstruction(BaseModel):
     quantity: Optional[float] = Field(
         default=None,
         description=(
-            "标的币数量（如 BTC 数量）。开仓必填；平仓可省略（缺省=全部平掉）；"
-            "清仓/平仓尽量给一个具体数值，执行器会按持仓数量截断"
+            "标的币数量（如 BTC 数量）。开仓无需填写（系统按 margin×杠杆/价格自动换算）；"
+            "平仓可省略（缺省=全部平掉）；REPLACE_LIMIT 更改挂单必填"
+        ),
+    )
+    margin: Optional[float] = Field(
+        default=None,
+        description=(
+            "初始保证金（USDT）。仅 OPEN_LONG / OPEN_SHORT 开仓必填："
+            "系统按 数量 = margin × 杠杆 / 开仓价 自动换算下单，"
+            "订单名义价值 = margin × 杠杆。平仓/挂单管理仍用 quantity（币数量）"
         ),
     )
     leverage: Optional[int] = Field(
@@ -72,11 +80,16 @@ class TradeInstruction(BaseModel):
 
     @model_validator(mode="after")
     def _require_stop_loss_on_open(self):
-        """开仓动作必须带止损；止盈可选。"""
+        """开仓动作必须带止损（止盈可选）和初始保证金。"""
         if self.action in (OrderAction.OPEN_LONG, OrderAction.OPEN_SHORT):
             if self.stop_loss is None:
                 raise ValueError(
                     f"{self.symbol} {self.action} 必须设置 stop_loss（止损），止盈可选"
+                )
+            if self.margin is None or self.margin <= 0:
+                raise ValueError(
+                    f"{self.symbol} {self.action} 必须设置 margin>0（初始保证金 USDT）；"
+                    f"数量由系统按 margin×杠杆/价格自动换算"
                 )
         return self
 
@@ -147,6 +160,8 @@ class TradingDecision(BaseModel):
 
 
 # 输出给模型的 JSON 示例，用于 few-shot 约束格式
+# 开仓（OPEN_LONG/OPEN_SHORT）只输出 margin（初始保证金 USDT），数量由系统自动换算；
+# 挂单管理（REPLACE_LIMIT/CANCEL_ORDERS/SET_SL_TP）与平仓才用到 quantity（币数量）。
 DECISION_JSON_SCHEMA_HINT = """{
   "market_assessment": "整体偏多/偏空/震荡的简短判断...",
   "instructions": [
@@ -155,11 +170,12 @@ DECISION_JSON_SCHEMA_HINT = """{
       "action": "OPEN_LONG",
       "order_type": "MARKET",
       "price": null,
-      "quantity": 0.05,
-      "leverage": 5,
+      "quantity": null,
+      "margin": 60,
+      "leverage": 15,
       "stop_loss": 94000,
       "take_profit": 100000,
-      "reason": "MACD金叉且价格站上50SMA，趋势偏多"
+      "reason": "MACD金叉且价格站上50SMA，趋势偏多；margin=60U ≈ 名义价值 900U，约可用余额的15%"
     },
     {
       "symbol": "BTCUSDT",
@@ -167,6 +183,7 @@ DECISION_JSON_SCHEMA_HINT = """{
       "order_type": "LIMIT",
       "price": null,
       "quantity": null,
+      "margin": null,
       "leverage": null,
       "stop_loss": null,
       "take_profit": null,
@@ -179,6 +196,7 @@ DECISION_JSON_SCHEMA_HINT = """{
       "order_type": "LIMIT",
       "price": 3450,
       "quantity": 2.0,
+      "margin": null,
       "leverage": null,
       "stop_loss": null,
       "take_profit": null,
@@ -191,6 +209,7 @@ DECISION_JSON_SCHEMA_HINT = """{
       "order_type": "MARKET",
       "price": null,
       "quantity": null,
+      "margin": null,
       "leverage": null,
       "stop_loss": 96000,
       "take_profit": 101000,

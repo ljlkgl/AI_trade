@@ -51,6 +51,40 @@ def _format_account_ctx(account, open_orders_by_symbol=None) -> str:
     return format_account_context(account, open_orders_by_symbol)
 
 
+def _merge_open_orders(symbol: str, client: BinanceClient) -> list[dict]:
+    """合并某币种普通订单与算法条件单（止盈止损），并统一为普通订单字段形状。
+
+    2025-12-09 起 STOP_MARKET/TAKE_PROFIT_MARKET 走 /fapi/v1/algoOrder，
+    查询/撤销需用 algoId；此处将算法单字段映射成 orderId/type/stopPrice 等
+    统一形状，供决策者/确认者/结果展示直接使用。
+    """
+    orders: list[dict] = []
+    try:
+        orders = list(client.get_open_orders(symbol))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("获取 %s 普通挂单失败: %s", symbol, exc)
+    try:
+        for ao in client.get_open_algo_orders(symbol):
+            orders.append({
+                "orderId": ao.get("algoId"),
+                "clientOrderId": ao.get("clientAlgoId"),
+                "symbol": ao.get("symbol"),
+                "side": ao.get("side"),
+                "positionSide": ao.get("positionSide"),
+                "type": ao.get("orderType") or ao.get("type"),
+                "price": ao.get("price"),
+                "stopPrice": ao.get("triggerPrice"),
+                "origQty": ao.get("quantity"),
+                "executedQty": "0",
+                "reduceOnly": ao.get("reduceOnly"),
+                "status": ao.get("algoStatus") or ao.get("status"),
+                "is_algo": True,
+            })
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("获取 %s 条件单(Algo)失败: %s", symbol, exc)
+    return orders
+
+
 class TradingSystem:
     """整合行情→分析→决策→风控→执行→假设记录的主流程。"""
 
@@ -87,12 +121,45 @@ class TradingSystem:
         # 执行前逐条确认者（用 quick 模型：单条指令的轻量复核）
         self.confirmer = Confirmer(self.llm)
         self.risk = RiskManager()
-        self.executor = OrderExecutor(self.client, self.risk)
+        # 启动时检查持仓模式：单向(One-way)则切换为双向(Hedge Mode)
+        self.hedge_mode = False
+        try:
+            self.hedge_mode = self._init_hedge_mode()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("检查持仓模式失败（按单向模式运行）: %s", exc)
+        self.executor = OrderExecutor(
+            self.client, self.risk, hedge_mode=self.hedge_mode
+        )
         self.hypotheses = HypothesisStore()
         self.experiences = ExperienceStore()
         self.watch_store = WatchStore(max_age_hours=config.watch_max_age_hours)
         self.symbols = config.symbols
         self._last_reflection: Optional[dict] = None
+
+    def _init_hedge_mode(self) -> bool:
+        """检查账户持仓模式；单向则尝试切换为双向持仓。
+
+        返回 True=双向模式（下单带 positionSide）；False=单向模式（切换失败或查询失败，
+        系统按单向模式继续运行，不阻塞）。
+        """
+        try:
+            dual = self.client.get_position_mode()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("查询持仓模式失败: %s", exc)
+            return False
+        if dual:
+            logger.info("账户为双向持仓模式（Hedge Mode）")
+            return True
+        logger.warning("账户为单向持仓模式，尝试切换为双向持仓...")
+        try:
+            self.client.set_position_mode(True)
+            logger.info("已切换为双向持仓模式（Hedge Mode）")
+            return True
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                "切换双向持仓失败（账户存在持仓或挂单时无法切换，需先平仓）: %s", exc
+            )
+            return False
 
     def run_once(self) -> dict:
         """执行一轮完整的 行情→分析→决策→风控→执行→假设记录。"""
@@ -130,10 +197,11 @@ class TradingSystem:
         }
 
         # 1.5 未成交挂单（决策者/确认者管理挂单、调止盈止损必需：含订单ID）
+        # 普通订单 + 算法条件单（止盈止损）合并展示，统一字段形状
         open_orders_by_symbol: dict[str, list] = {}
         for sym in self.symbols:
             try:
-                open_orders_by_symbol[sym] = self.client.get_open_orders(sym)
+                open_orders_by_symbol[sym] = _merge_open_orders(sym, self.client)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("获取 %s 未成交挂单失败: %s", sym, exc)
                 open_orders_by_symbol[sym] = []
@@ -240,7 +308,7 @@ class TradingSystem:
             {
                 "symbol": i.symbol, "action": i.action.value,
                 "order_type": i.order_type.value, "price": i.price,
-                "quantity": i.quantity, "leverage": i.leverage,
+                "quantity": i.quantity, "margin": i.margin, "leverage": i.leverage,
                 "stop_loss": i.stop_loss, "take_profit": i.take_profit,
                 "reason": i.reason,
             }
@@ -267,7 +335,7 @@ class TradingSystem:
                     logger.warning("刷新账户失败（沿用轮起始快照）: %s", exc)
                 # 刷新该币种未成交挂单（前几条指令可能已撤销/新挂单）
                 try:
-                    open_orders_by_symbol[ins.symbol] = self.client.get_open_orders(ins.symbol)
+                    open_orders_by_symbol[ins.symbol] = _merge_open_orders(ins.symbol, self.client)
                 except Exception:  # noqa: BLE001
                     pass
                 prior_summary = "\n".join(
@@ -413,7 +481,7 @@ class TradingSystem:
                 "market_assessment": decision.market_assessment,
                 "instructions": [
                     {"symbol": i.symbol, "action": i.action.value,
-                     "quantity": i.quantity, "leverage": i.leverage,
+                     "quantity": i.quantity, "margin": i.margin, "leverage": i.leverage,
                      "stop_loss": i.stop_loss, "take_profit": i.take_profit,
                      "reason": i.reason}
                     for i in decision.instructions
@@ -507,10 +575,14 @@ class TradingSystem:
             if action in ("OPEN_LONG", "OPEN_SHORT") and r.get("status") in ("DRY_RUN", "OPENED"):
                 pos_side = "LONG" if action == "OPEN_LONG" else "SHORT"
                 entry = ins.price or price_map.get(symbol, 0)
+                lev = ins.leverage or 1
+                margin = ins.margin or 0
+                qty = (margin * lev / entry) if (margin > 0 and entry > 0) else 0
                 self.hypotheses.set(symbol, {
                     "side": pos_side,
                     "entry_price": entry,
-                    "quantity": ins.quantity,
+                    "quantity": qty,
+                    "margin": margin,
                     "leverage": ins.leverage,
                     "stop_loss": ins.stop_loss,
                     "take_profit": ins.take_profit,
@@ -602,9 +674,9 @@ def main() -> None:
         for ins in result.get("instructions_after_risk", []):
             print(
                 f"- {ins['symbol']} {ins['action']} "
-                f"type={ins['order_type']} qty={ins['quantity']} "
-                f"price={ins['price']} lev={ins['leverage']} "
-                f"sl={ins['stop_loss']} tp={ins['take_profit']}"
+                f"type={ins['order_type']} margin={ins.get('margin')} "
+                f"qty={ins.get('quantity')} price={ins['price']} "
+                f"lev={ins['leverage']} sl={ins['stop_loss']} tp={ins['take_profit']}"
             )
         if result.get("risk_blocked"):
             print("\n被风控拦截的指令:")

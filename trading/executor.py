@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import logging
 import uuid
-from typing import Optional
+from typing import Any, Optional
 
 from agents.schemas import OrderAction, OrderType, TradeInstruction
 from config import config
@@ -16,9 +16,6 @@ from trading.risk import RiskManager
 from trading.types import AccountInfo
 
 logger = logging.getLogger(__name__)
-
-# 止盈止损单使用的 reduceOnly 标志位常量
-STOP_ORDER_TIF = "GTC"
 
 
 def round_to_step(value: float, step: float) -> float:
@@ -44,12 +41,25 @@ class OrderExecutor:
         client: BinanceClient,
         risk_manager: RiskManager,
         dry_run: Optional[bool] = None,
+        hedge_mode: bool = False,
     ) -> None:
         self.client = client
         self.risk = risk_manager
         self.dry_run = config.dry_run if dry_run is None else dry_run
+        # 双向持仓模式(Hedge Mode)：下单需带 positionSide；单向模式为 None
+        self.hedge_mode = hedge_mode
 
     # ---------- 工具 ----------
+
+    def _ps(self, position_side: str) -> Optional[str]:
+        """双向模式返回 positionSide（LONG/SHORT）；单向模式返回 None（不下传）。"""
+        return position_side if self.hedge_mode else None
+
+    def _pos_side(self, pos) -> str:
+        """从持仓对象推导仓位方向：优先真实 positionSide，回退按数量符号。"""
+        if pos.position_side in ("LONG", "SHORT"):
+            return pos.position_side
+        return "LONG" if pos.position_amt > 0 else "SHORT"
 
     def _quantity(self, symbol_info, qty: float) -> float:
         q = round_to_step(abs(qty), symbol_info.qty_step)
@@ -116,7 +126,8 @@ class OrderExecutor:
                     })
                     continue
                 order = self.client.close_position(
-                    symbol=p.symbol, side=side, quantity=qty
+                    symbol=p.symbol, side=side, quantity=qty,
+                    position_side=self._ps(self._pos_side(p)),
                 )
                 logger.warning(
                     "紧急平仓 %s %s qty=%s side=%s -> %s（%s）",
@@ -125,7 +136,7 @@ class OrderExecutor:
                 results.append({
                     "symbol": p.symbol, "action": "EMERGENCY_FLATTEN",
                     "status": "CLOSED", "side": side, "quantity": qty, "order": order,
-                    "reason": reason,
+                    "order_id": order.get("orderId"), "reason": reason,
                 })
             except Exception as exc:  # noqa: BLE001
                 logger.exception("紧急平仓失败 %s: %s", p.symbol, exc)
@@ -219,6 +230,7 @@ class OrderExecutor:
                 price=price,
                 time_in_force="GTC",
                 client_order_id=self._client_order_id("rp"),
+                position_side=self._ps("LONG" if side == "BUY" else "SHORT"),
             )
             logger.info(
                 "%s 已改单：撤销 %d 笔 LIMIT 挂单并新挂 LIMIT %s qty=%s price=%s",
@@ -226,7 +238,7 @@ class OrderExecutor:
             )
             base.update(status="REPLACED", side=side, quantity=qty,
                         price=price, order_type="LIMIT", order=order,
-                        cancelled_ids=cancelled)
+                        order_id=order.get("orderId"), cancelled_ids=cancelled)
         except BinanceError as exc:
             base.update(status="FAILED", error=str(exc))
         return base
@@ -260,7 +272,10 @@ class OrderExecutor:
 
         try:
             cancelled = self._cancel_protective_orders(ins.symbol)
-            placed = self._place_stop_loss_take_profit(ins, qty, protective_side)
+            placed = self._place_stop_loss_take_profit(
+                ins, qty, protective_side,
+                protective_position_side=self._ps(self._pos_side(pos)),
+            )
             logger.info(
                 "%s 已调整止盈止损：撤销 %d 笔旧保护单，重挂 %d 笔（sl=%s tp=%s）",
                 ins.symbol, len(cancelled), len(placed),
@@ -273,22 +288,44 @@ class OrderExecutor:
             base.update(status="FAILED", error=str(exc))
         return base
 
-    def _cancel_protective_orders(self, symbol: str) -> list[int]:
-        """撤销该币种全部未成交的止损/止盈保护单，返回被撤销的 orderId 列表。"""
-        cancelled: list[int] = []
+    def _cancel_protective_orders(self, symbol: str) -> list[Any]:
+        """撤销该币种全部未成交的止损/止盈保护单，返回被撤销的 ID 列表（orderId 或 algoId）。"""
+        cancelled: list[Any] = []
+        # 普通订单（旧接口遗留）
         for order in self.client.get_open_orders(symbol):
             if order.get("type") in ("STOP_MARKET", "TAKE_PROFIT_MARKET"):
                 self.client.cancel_order(symbol, order["orderId"])
                 cancelled.append(order["orderId"])
+        # 算法条件单（新接口）
+        for order in self.client.get_open_algo_orders(symbol):
+            o_type = order.get("orderType") or order.get("type")
+            if o_type in ("STOP_MARKET", "TAKE_PROFIT_MARKET") and order.get("algoStatus") == "NEW":
+                self.client.cancel_algo_order(symbol, order["algoId"])
+                cancelled.append(order["algoId"])
         return cancelled
 
     def _open(
         self, ins: TradeInstruction, symbol_info, mark_price: float, base: dict
     ) -> dict:
         side = "BUY" if ins.action == OrderAction.OPEN_LONG else "SELL"
-        qty = self._quantity(symbol_info, ins.quantity or 0)
+        leverage = ins.leverage if ins.leverage else 1
+        # 入场价：限价单用挂单价，市价单用当前标记价（决定换算数量与风控口径）
+        entry_price = ins.price if (ins.order_type == OrderType.LIMIT and ins.price) else mark_price
+        if entry_price <= 0:
+            base.update(status="REJECTED", error="无效入场价")
+            return base
+        # 由初始保证金换算数量：名义价值 = margin × 杠杆；数量 = 名义价值 / 开仓价
+        margin = ins.margin
+        if margin is None or margin <= 0:
+            base.update(status="REJECTED", error="开仓必须提供 margin>0（初始保证金，USDT）")
+            return base
+        notional = margin * leverage
+        qty = self._quantity(symbol_info, notional / entry_price)
         if qty <= 0:
-            base.update(status="REJECTED", error="数量无效")
+            base.update(
+                status="REJECTED",
+                error="数量无效（margin×杠杆/开仓价 换算结果过小，需增大保证金或杠杆）",
+            )
             return base
         price = None
         order_type = "MARKET"
@@ -301,8 +338,8 @@ class OrderExecutor:
 
         if self.dry_run:
             logger.info(
-                "[DRY_RUN] %s %s qty=%s price=%s lev=%s sl=%s tp=%s",
-                ins.symbol, ins.action.value, qty, price, ins.leverage,
+                "[DRY_RUN] %s %s qty=%s price=%s lev=%s margin=%s notional=%s sl=%s tp=%s",
+                ins.symbol, ins.action.value, qty, price, leverage, margin, notional,
                 ins.stop_loss, ins.take_profit,
             )
             base.update(
@@ -311,11 +348,12 @@ class OrderExecutor:
                 side=side,
                 quantity=qty,
                 price=price,
+                margin=margin,
+                notional=notional,
             )
             return base
 
         # 真实下单
-        leverage = ins.leverage if ins.leverage else 1
         try:
             self.client.set_margin_type(ins.symbol, "ISOLATED")
         except BinanceError as exc:
@@ -333,19 +371,28 @@ class OrderExecutor:
             price=price,
             time_in_force="GTC" if order_type == "LIMIT" else None,
             client_order_id=self._client_order_id("open"),
+            position_side=self._ps("LONG" if ins.action == OrderAction.OPEN_LONG else "SHORT"),
         )
         result = dict(base)
         result.update(
             status="OPENED",
             order=order,
+            order_id=order.get("orderId"),
             quantity=qty,
             price=price,
             order_type=order_type,
+            margin=margin,
+            notional=notional,
         )
         # 挂止损止盈（LIMIT 单未成交时 reduceOnly 保护单可能被拒，降级不致命）
         if ins.stop_loss is not None or ins.take_profit is not None:
             try:
-                sl_tp = self._place_stop_loss_take_profit(ins, qty, side)
+                sl_tp = self._place_stop_loss_take_profit(
+                    ins, qty, side,
+                    protective_position_side=self._ps(
+                        "LONG" if ins.action == OrderAction.OPEN_LONG else "SHORT"
+                    ),
+                )
                 result["sl_tp_orders"] = sl_tp
             except BinanceError as exc:
                 logger.warning(
@@ -355,41 +402,55 @@ class OrderExecutor:
         return result
 
     def _place_stop_loss_take_profit(
-        self, ins: TradeInstruction, qty: float, protective_side: str
+        self,
+        ins: TradeInstruction,
+        qty: float,
+        protective_side: str,
+        protective_position_side: Optional[str] = None,
     ) -> list[dict]:
-        """为仓位挂 STOP_MARKET / TAKE_PROFIT_MARKET 保护单。
+        """为仓位挂 STOP_MARKET / TAKE_PROFIT_MARKET 保护单（Algo Order API）。
 
         protective_side：保护单方向（多头仓位→SELL 保护；空头仓位→BUY 保护）。
+        protective_position_side：双向模式下保护单所属仓位方向 LONG/SHORT（单向为 None）。
+        双向模式(Hedge Mode)禁传 reduceOnly（由 positionSide 指定仓位方向）；
+        单向模式传 positionSide=BOTH + reduceOnly=True。
         """
         placed = []
-        side = protective_side
         symbol_info = self.client.get_symbol_info(ins.symbol)
+        if self.hedge_mode:
+            algo_position_side = protective_position_side or "BOTH"
+            reduce_only = None
+        else:
+            algo_position_side = "BOTH"
+            reduce_only = True
         if ins.stop_loss is not None:
             sl = self._price(symbol_info, ins.stop_loss)
-            order = self.client.place_order(
+            order = self.client.place_algo_order(
                 symbol=ins.symbol,
-                side=side,
+                side=protective_side,
                 order_type="STOP_MARKET",
                 quantity=qty,
-                stop_price=sl,
-                reduce_only=True,
-                time_in_force=STOP_ORDER_TIF,
-                client_order_id=self._client_order_id("sl"),
+                trigger_price=sl,
+                position_side=algo_position_side,
+                client_algo_id=self._client_order_id("sl"),
+                reduce_only=reduce_only,
             )
-            placed.append({"kind": "stop_loss", "order": order})
+            placed.append({"kind": "stop_loss", "order": order,
+                           "order_id": order.get("algoId")})
         if ins.take_profit is not None:
             tp = self._price(symbol_info, ins.take_profit)
-            order = self.client.place_order(
+            order = self.client.place_algo_order(
                 symbol=ins.symbol,
-                side=side,
+                side=protective_side,
                 order_type="TAKE_PROFIT_MARKET",
                 quantity=qty,
-                stop_price=tp,
-                reduce_only=True,
-                time_in_force=STOP_ORDER_TIF,
-                client_order_id=self._client_order_id("tp"),
+                trigger_price=tp,
+                position_side=algo_position_side,
+                client_algo_id=self._client_order_id("tp"),
+                reduce_only=reduce_only,
             )
-            placed.append({"kind": "take_profit", "order": order})
+            placed.append({"kind": "take_profit", "order": order,
+                           "order_id": order.get("algoId")})
         return placed
 
     def _close(
@@ -449,6 +510,8 @@ class OrderExecutor:
             quantity=qty,
             order_type=order_type,
             price=price,
+            position_side=self._ps(self._pos_side(pos)),
         )
-        base.update(status="CLOSED", side=close_side, quantity=qty, order=order)
+        base.update(status="CLOSED", side=close_side, quantity=qty,
+                    order=order, order_id=order.get("orderId"))
         return base

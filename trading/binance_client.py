@@ -160,6 +160,18 @@ class BinanceClient:
 
     # ---------------- 账户（签名接口） ----------------
 
+    def get_position_mode(self) -> bool:
+        """查询持仓模式：True=双向持仓(Hedge Mode)，False=单向持仓(One-way)。"""
+        data = self._signed_request("GET", "/fapi/v1/positionSide/dual")
+        return bool(data.get("dualSidePosition", False))
+
+    def set_position_mode(self, dual: bool = True) -> dict:
+        """切换持仓模式（默认切到双向）。注意：切换前账户不能有持仓或未成交挂单。"""
+        return self._signed_request(
+            "POST", "/fapi/v1/positionSide/dual",
+            {"dualSidePosition": "true" if dual else "false"},
+        )
+
     def get_account(self) -> AccountInfo:
         """获取账户资金与持仓快照。"""
         data = self._signed_request("GET", "/fapi/v3/account")
@@ -218,15 +230,22 @@ class BinanceClient:
         self,
         symbol: str,
         side: str,                     # BUY / SELL
-        order_type: str,               # MARKET / LIMIT / STOP_MARKET / TAKE_PROFIT_MARKET
+        order_type: str,               # MARKET / LIMIT（条件单请用 place_algo_order）
         quantity: float,
         price: Optional[float] = None,
         stop_price: Optional[float] = None,
         reduce_only: bool = False,
         time_in_force: str = "GTC",
         client_order_id: Optional[str] = None,
+        position_side: Optional[str] = None,
     ) -> dict:
-        """下单。quantity 为标的币数量（BTC 等），非张数。"""
+        """下单。quantity 为标的币数量（BTC 等），非张数。
+
+        注意：2025-12-09 起 STOP_MARKET/TAKE_PROFIT_MARKET 条件单必须走
+        place_algo_order()（/fapi/v1/algoOrder），本方法仅用于 MARKET/LIMIT。
+
+        position_side：双向持仓模式(Hedge Mode)下必填 LONG/SHORT；单向模式为 None。
+        """
         params: dict[str, Any] = {
             "symbol": symbol,
             "side": side,
@@ -243,13 +262,19 @@ class BinanceClient:
             params["timeInForce"] = time_in_force
         if client_order_id:
             params["newClientOrderId"] = client_order_id
+        if position_side:
+            params["positionSide"] = position_side
         return self._signed_request("POST", "/fapi/v1/order", params)
 
     def close_position(
         self, symbol: str, side: str, quantity: float, order_type: str = "MARKET",
         price: Optional[float] = None, stop_price: Optional[float] = None,
+        position_side: Optional[str] = None,
     ) -> dict:
-        """平仓（reduceOnly）。side 为平仓方向：多头→SELL，空头→BUY。"""
+        """平仓（reduceOnly）。side 为平仓方向：多头→SELL，空头→BUY。
+
+        position_side：双向持仓模式(Hedge Mode)下必填 LONG/SHORT；单向模式为 None。
+        """
         return self.place_order(
             symbol=symbol,
             side=side,
@@ -258,6 +283,7 @@ class BinanceClient:
             price=price,
             stop_price=stop_price,
             reduce_only=True,
+            position_side=position_side,
         )
 
     def get_order(self, symbol: str, order_id: int) -> dict:
@@ -276,4 +302,55 @@ class BinanceClient:
     def cancel_all_orders(self, symbol: str) -> list[dict]:
         return self._signed_request(
             "DELETE", "/fapi/v1/allOpenOrders", {"symbol": symbol}
+        )
+
+    # ---------------- 条件单（Algo Order API，2025-12-09 迁移） ----------------
+    # 2025-12-09 起 STOP_MARKET / TAKE_PROFIT_MARKET 必须走 /fapi/v1/algoOrder；
+    # 参数 stopPrice 改为 triggerPrice，新增 algoType=CONDITIONAL；
+    # 响应句柄为 algoId（与普通订单 orderId 不同）。
+
+    def place_algo_order(
+        self,
+        symbol: str,
+        side: str,                     # BUY / SELL（保护单方向）
+        order_type: str,               # STOP_MARKET / TAKE_PROFIT_MARKET
+        quantity: float,
+        trigger_price: float,
+        position_side: str = "BOTH",   # 双向模式 LONG/SHORT；单向模式 BOTH
+        working_type: str = "CONTRACT_PRICE",
+        client_algo_id: Optional[str] = None,
+        reduce_only: Optional[bool] = None,
+    ) -> dict:
+        """挂条件单（止损/止盈）。返回的 algoId 为该条件单句柄。"""
+        params: dict[str, Any] = {
+            "symbol": symbol,
+            "side": side,
+            "type": order_type,
+            "algoType": "CONDITIONAL",
+            "triggerPrice": trigger_price,
+            "quantity": quantity,
+            "positionSide": position_side,
+            "workingType": working_type,
+        }
+        if client_algo_id:
+            params["clientAlgoId"] = client_algo_id[:36]
+        if reduce_only is not None:
+            params["reduceOnly"] = "true" if reduce_only else "false"
+        return self._signed_request("POST", "/fapi/v1/algoOrder", params)
+
+    def get_open_algo_orders(self, symbol: Optional[str] = None) -> list[dict]:
+        """查询未成交条件单（STOP/TP 保护单）。端点返回 {"orders":[...]}，此处解包为 list。"""
+        params: dict[str, Any] = {}
+        if symbol:
+            params["symbol"] = symbol
+        res = self._signed_request("GET", "/fapi/v1/openAlgoOrders", params)
+        if isinstance(res, dict):
+            return res.get("orders", []) or []
+        return res or []
+
+    def cancel_algo_order(self, symbol: str, algo_id: Any) -> dict:
+        """撤销单个条件单（按 algoId）。"""
+        return self._signed_request(
+            "DELETE", "/fapi/v1/algoOrder",
+            {"symbol": symbol, "algoId": algo_id},
         )

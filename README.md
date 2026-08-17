@@ -199,6 +199,20 @@ python main.py --interval 30
 `CANCEL_ORDERS` / `REPLACE_LIMIT` / `SET_SL_TP`；确认者（Confirmer）在每条指令执行前
 也会收到同样的最新账户与挂单快照。
 
+## 持仓模式（Hedge Mode）
+
+系统启动时自动检查账户持仓模式：
+
+1. 查询 `GET /fapi/v1/positionSide/dual`；
+2. 若为**单向持仓（One-way）**，自动尝试切换为**双向持仓（Hedge Mode）**
+   （`POST dualSidePosition=true`），以便同时持有多空两个方向；
+3. **切换失败**（币安要求切换前账户无持仓、无挂单）→ 记录错误并按单向模式继续运行，
+   不会阻塞启动；等持仓清零后重启即可切换；
+4. 双向模式下所有下单自动携带 `positionSide`（LONG/SHORT），单向模式则不携带。
+
+> 若长期使用双向模式，建议在币安 App/网页端手动将账户持仓模式设为"双向持仓"，
+> 避免程序每次启动时尝试切换。
+
 ## 服务器部署
 
 ### Docker

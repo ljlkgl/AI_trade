@@ -2,10 +2,10 @@
 
 校验规则（与决策者提示词中的硬约束一致）：
 1. 杠杆 ≤ max_leverage
-2. 单笔名义价值 ≥ min_notional；单笔保证金 ≥ min_margin
-3. 单笔保证金 ≤ 账户可用余额（真实可成交性底线）
-4. 止损强制与方向合理性
-仓位大小（quantity/保证金占用）由模型自主决定，不做比例拦截。
+2. 单笔名义价值（= 初始保证金 × 杠杆）≥ min_notional；初始保证金 ≥ min_margin
+3. 初始保证金 ≤ 账户可用余额（真实可成交性底线）
+4. 止损强制与方向合理性；换算出的下单数量 ≥ 交易所最小下单量
+仓位大小（初始保证金）由模型自主决定，不做比例拦截。
 """
 from __future__ import annotations
 
@@ -111,37 +111,46 @@ class RiskManager:
 
         pos = self.current_position(account, instruction.symbol)
 
-        # 开仓类：校验杠杆 + 名义价值 + 保证金（仓位大小交给模型自主决定）
+        # 开仓类：校验初始保证金 + 杠杆 + 名义价值（名义 = 保证金×杠杆）
         if instruction.action in (OrderAction.OPEN_LONG, OrderAction.OPEN_SHORT):
-            qty = instruction.quantity
             lev = instruction.leverage or 1
-            if qty is None or qty <= 0:
-                errors.append(f"{instruction.symbol}: 开仓必须提供 quantity>0")
-            else:
-                new_nominal = abs(qty) * (instruction.price or mark_price)
-                if new_nominal < self.min_notional:
-                    errors.append(
-                        f"{instruction.symbol}: 单笔名义价值 {new_nominal:.2f} "
-                        f"低于最小限制 {self.min_notional:.2f} USDT"
-                    )
-            if lev > self.max_leverage:
+            entry = instruction.price or mark_price
+            margin = instruction.margin
+            if margin is None or margin <= 0:
                 errors.append(
-                    f"{instruction.symbol}: 杠杆 {lev} 超过上限 {self.max_leverage}"
+                    f"{instruction.symbol}: 开仓必须提供 margin>0（初始保证金，USDT）"
                 )
-            # 保证金下限校验：保证金 = quantity * price / leverage，须 ≥ min_margin
-            if qty is not None and qty > 0:
-                margin = abs(qty) * (instruction.price or mark_price) / lev
+            else:
+                notional = margin * lev
+                if notional < self.min_notional:
+                    errors.append(
+                        f"{instruction.symbol}: 单笔名义价值 {notional:.2f} "
+                        f"低于最小限制 {self.min_notional:.2f} USDT（名义价值=保证金×杠杆）"
+                    )
                 if margin < self.min_margin:
                     errors.append(
                         f"{instruction.symbol}: 开仓保证金 {margin:.4f} USDT "
-                        f"低于最小保证金 {self.min_margin:.2f} USDT（quantity×price/leverage）"
+                        f"低于最小保证金 {self.min_margin:.2f} USDT"
                     )
-                # 可用余额校验：单笔保证金不得超过账户可用余额（真实可成交性底线）
+                # 可用余额校验：初始保证金不得超过账户可用余额（真实可成交性底线）
                 if margin > account.available_balance:
                     errors.append(
                         f"{instruction.symbol}: 开仓保证金 {margin:.4f} USDT "
                         f"超过可用余额 {account.available_balance:.4f} USDT"
                     )
+                # 换算数量（保证金×杠杆/开仓价）按 step 取整后不得低于交易所最小下单量
+                if entry > 0 and symbol_info.qty_step > 0:
+                    qty = notional / entry
+                    q_rounded = int(round(qty / symbol_info.qty_step)) * symbol_info.qty_step
+                    if q_rounded < symbol_info.min_qty:
+                        errors.append(
+                            f"{instruction.symbol}: 保证金 {margin:.4f}×杠杆{lev} 换算数量 "
+                            f"{q_rounded:.6g} 低于最小下单量 {symbol_info.min_qty:.6g}（需增大保证金或杠杆）"
+                        )
+            if lev > self.max_leverage:
+                errors.append(
+                    f"{instruction.symbol}: 杠杆 {lev} 超过上限 {self.max_leverage}"
+                )
             # 止损强制：开仓必须带止损
             if instruction.stop_loss is None:
                 errors.append(f"{instruction.symbol}: 开仓必须设置 stop_loss（止损）")

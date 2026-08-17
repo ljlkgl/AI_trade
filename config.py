@@ -72,7 +72,7 @@ class Config:
         self.max_total_position_ratio = _get_float("MAX_TOTAL_POSITION_RATIO", 0.8)
         self.max_leverage = _get_int("MAX_LEVERAGE", 20)
         self.min_notional = _get_float("MIN_NOTIONAL", 20.0)
-        # 单笔开仓所需保证金下限（USDT），保证金 = quantity * price / leverage
+        # 单笔开仓所需初始保证金下限（USDT）；名义价值 = 保证金 × 杠杆
         self.min_margin = _get_float("MIN_MARGIN", 2.5)
         self.dry_run: bool = _get_bool("DRY_RUN", True)
 
