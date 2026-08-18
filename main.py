@@ -133,8 +133,11 @@ class TradingSystem:
         self.executor = OrderExecutor(
             self.client, self.risk, hedge_mode=self.hedge_mode
         )
-        self.theses = ThesisStore(max_age_hours=config.thesis_max_age_hours)
-        self.experiences = ExperienceStore()
+        self.theses = ThesisStore(
+            max_age_hours=config.thesis_max_age_hours,
+            max_items=config.thesis_max_items,
+        )
+        self.experiences = ExperienceStore(max_items=config.experience_max_items)
         self.watch_store = WatchStore(max_age_hours=config.watch_max_age_hours)
         self.round_log = RoundLog()
         self.runtime = RuntimeState()
@@ -318,6 +321,7 @@ class TradingSystem:
                 experience_context=experience_context,
                 open_orders_by_symbol=open_orders_by_symbol,
                 min_margin_context=min_margin_context,
+                last_round_feedback=self.runtime.last_feedback(),
             )
             logger.info(
                 "决策: %d 条指令, %d 条理由操作, 评估=%s",
@@ -462,10 +466,29 @@ class TradingSystem:
             logger.info("无通过风控的指令，本轮不交易")
         result["execution"] = exec_results
 
+        # 9.5 保存上一轮执行反馈（风控拦截 / 执行结果），供下一轮决策者参考并纠正
+        #     否则模型永远不知道上轮指令为何未成交（如保证金不足被拦截），会重复犯错
+        try:
+            self.runtime.set_feedback(
+                self._build_round_feedback(result.get("risk_blocked", []), exec_results)
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("保存上一轮执行反馈失败: %s", exc)
+
         # 10. 应用模型对「操作理由列表」的操作（模型拥有完整操作权：ADD/UPDATE/DELETE），
         #     并同步列表：为新开仓/新挂单补录理由、按真实账户清理过期条目
+        #     本轮实际执行成功（含 DRY_RUN）的开仓币种，用于校验模型 ADD 的持仓理由是否成立
+        executed_open_symbols = {
+            r.get("symbol") for r in exec_results
+            if r.get("action") in ("OPEN_LONG", "OPEN_SHORT")
+            and r.get("status") in ("OPENED", "DRY_RUN")
+        }
         try:
-            self._apply_thesis_ops(decision.thesis_ops)
+            self._apply_thesis_ops(
+                decision.thesis_ops,
+                executed_open_symbols=executed_open_symbols,
+                account=account,
+            )
         except Exception as exc:  # noqa: BLE001
             logger.error("应用理由列表操作失败: %s", exc)
         try:
@@ -478,6 +501,7 @@ class TradingSystem:
         self._reflect_and_apply(
             decision, exec_results, account, thesis_context, market_report,
             open_orders_by_symbol=open_orders_by_symbol,
+            risk_blocked=result.get("risk_blocked", []),
         )
         if self._last_reflection:
             result["reflection"] = self._last_reflection
@@ -515,6 +539,37 @@ class TradingSystem:
         except Exception as exc:  # noqa: BLE001
             logger.error("紧急平仓失败: %s", exc)
 
+    @staticmethod
+    def _build_round_feedback(risk_blocked: list[dict], exec_results: list[dict]) -> str:
+        """将上一轮的风控拦截与执行结果整理成决策者可见的反馈文本（供下一轮参考）。
+
+        模型此前完全不知道自己的指令为何未成交（例如保证金不足被风控拦截），
+        导致每轮重复犯同样的错。此反馈在每轮结束后持久化，下一轮决策时回传，
+        让模型知道上轮哪些指令被拦截/失败及原因，从而修正本轮决策。
+        """
+        lines: list[str] = []
+        for blk in risk_blocked:
+            sym = blk.get("symbol", "?")
+            errs = blk.get("errors") or []
+            lines.append(f"- [{sym}] 上轮指令被风控拦截：{'；'.join(errs)}")
+        for ex in exec_results:
+            sym = ex.get("symbol", "?")
+            act = ex.get("action", "?")
+            status = ex.get("status", "?")
+            if status in ("DRY_RUN", "OPENED", "CLOSED", "CANCELLED", "REPLACED",
+                          "ADJUSTED", "FAILED", "REJECTED", "SKIPPED"):
+                detail = ex.get("error") or ""
+                lines.append(
+                    f"- [{sym}] {act} -> {status}" + (f"：{detail}" if detail else "")
+                )
+        if not lines:
+            return ""
+        return (
+            "# 上一轮执行反馈（系统上一轮对指令的处理结果；"
+            "若你的指令曾被拦截或执行失败，请务必据此修正本轮决策）\n"
+            + "\n".join(lines)
+        )
+
     def _reflect_and_apply(
         self,
         decision,
@@ -523,6 +578,7 @@ class TradingSystem:
         thesis_context: str,
         market_report: str,
         open_orders_by_symbol: dict | None = None,
+        risk_blocked: list[dict] | None = None,
     ) -> None:
         """运行反思者并应用经验库操作。"""
         # 反思执行结果，失败/降级不阻断主流程
@@ -546,6 +602,7 @@ class TradingSystem:
                 account_context=_format_account_ctx(account, open_orders_by_symbol),
                 experience_context=self.experiences.format_for_context(),
                 previous_context=prev_ctx,
+                risk_blocked=risk_blocked,
             )
             self._last_reflection = {
                 "self_assessment": reflection.self_assessment,
@@ -594,14 +651,34 @@ class TradingSystem:
         except Exception as exc:  # noqa: BLE001
             logger.error("应用经验库操作失败 %s: %s", action, exc)
 
-    def _apply_thesis_ops(self, ops) -> None:
-        """应用模型对「操作理由列表」的操作（模型拥有完整操作权：ADD/UPDATE/DELETE）。"""
+    def _apply_thesis_ops(self, ops, executed_open_symbols=None, account=None) -> None:
+        """应用模型对「操作理由列表」的操作（模型拥有完整操作权：ADD/UPDATE/DELETE）。
+
+        系统侧防护：模型 ADD 的「持仓理由」必须与该币种真实持仓、或本轮实际执行成功的
+        开仓对应；若指令被风控拦截/从未成交（既无真实持仓也无本轮开仓成功），则拒绝写入，
+        避免把并不存在的仓位记入理由列表，误导后续轮次（账户实际为空却误以为仍有仓位）。
+        """
+        account_positions = {p.symbol for p in account.positions} if account else set()
+        executed_open_symbols = executed_open_symbols or set()
         for op in ops:
             try:
                 if op.action == ThesisAction.ADD:
+                    kind = op.kind or "position"
+                    if (
+                        kind == "position"
+                        and op.symbol not in account_positions
+                        and op.symbol not in executed_open_symbols
+                    ):
+                        logger.warning(
+                            "理由列表 ADD 拒绝：%s %s 未实际开仓（指令被拦截或未成交），"
+                            "不记录不存在的仓位",
+                            op.symbol, kind,
+                        )
+                        continue
                     self.theses.add(
                         symbol=op.symbol,
                         kind=op.kind or "position",
+                        parent_id=op.parent_id,
                         direction=op.direction,
                         entry_price=op.entry_price,
                         stop_loss=op.stop_loss,
@@ -615,7 +692,7 @@ class TradingSystem:
                             "kind": op.kind, "direction": op.direction,
                             "entry_price": op.entry_price, "stop_loss": op.stop_loss,
                             "take_profit": op.take_profit, "thesis": op.thesis,
-                            "note": op.note,
+                            "note": op.note, "parent_id": op.parent_id,
                         }.items() if v is not None
                     }
                     if not self.theses.update(op.thesis_id, **fields):

@@ -37,12 +37,18 @@ class ThesisStore:
         self,
         path: Optional[Path] = None,
         max_age_hours: Optional[int] = None,
+        max_items: Optional[int] = None,
     ) -> None:
         self.path = path or (Path(__file__).resolve().parent.parent / "state" / "theses.json")
         self.path.parent.mkdir(parents=True, exist_ok=True)
         # 无 max_age_hours 时不按时间自动过期（由账户状态清理兜底）
         self.max_age_hours = max_age_hours
+        # 条目硬上限：超出按「非持仓优先、最旧优先」淘汰，保证上下文/存储有界
+        self.max_items = max_items
         self._data: list[dict] = self._load()
+        # 启动时若已有状态文件超限，立即收敛（避免历史遗留文件一次性超量进上下文）
+        if self._enforce_max():
+            self.save()
         self._seq = self._next_seq()
 
     # ---------- 基础存取 ----------
@@ -107,10 +113,57 @@ class ThesisStore:
             "updated_at": datetime.now().isoformat(),
         }
         self._data.append(record)
+        self._enforce_max()
         self.save()
         logger.info("理由列表 ADD %s (%s %s%s)", record["id"], symbol, record["kind"],
                     f" 父={parent_id}" if parent_id else "")
         return record["id"]
+
+    def _enforce_max(self) -> int:
+        """条目数超上限时淘汰，保证上下文/存储有界。
+
+        优先淘汰「非持仓」的最旧条目（挂单/其它类相对可弃），仍超出才淘汰最旧的
+        持仓条目（安全阀，正常不会触发）。刚加入的记录不淘汰，让本轮操作生效。
+        被淘汰节点的全部子孙一并级联删除，与 remove 的级联语义一致。
+        """
+        if not self.max_items or len(self._data) <= self.max_items:
+            return 0
+        over = len(self._data) - self.max_items
+        to_remove: set[str] = set()
+        # 1) 优先淘汰非 position 的最旧条目
+        removable = [r for r in self._data[:-1] if r.get("kind") != "position"]
+        removable.sort(key=lambda x: x.get("updated_at", ""))
+        for r in removable:
+            if over <= 0:
+                break
+            to_remove.add(r.get("id", ""))
+            over -= 1
+        # 2) 仍超出则淘汰最旧 position 条目（安全阀）
+        if over > 0:
+            pos = [r for r in self._data[:-1] if r.get("kind") == "position"]
+            pos.sort(key=lambda x: x.get("updated_at", ""))
+            for r in pos:
+                if over <= 0:
+                    break
+                to_remove.add(r.get("id", ""))
+                over -= 1
+        if not to_remove:
+            return 0
+        # 级联：被淘汰节点的全部子孙一并删除（集合收敛，天然防环）
+        expanded: set[str] = set(to_remove)
+        changed = True
+        while changed:
+            changed = False
+            for r in self._data:
+                if r.get("parent_id") in expanded and r.get("id") not in expanded:
+                    expanded.add(r["id"])
+                    changed = True
+        self._data = [r for r in self._data if r.get("id") not in expanded]
+        logger.warning(
+            "理由列表超上限 %d 条，已淘汰 %d 条最旧/非持仓条目（含级联子孙），上下文有界",
+            self.max_items, len(expanded),
+        )
+        return len(expanded)
 
     def _descendant_ids(self, thesis_id: str) -> set[str]:
         """递归收集该节点的全部子孙 id（含多层层级，防环）。"""

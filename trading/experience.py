@@ -21,12 +21,17 @@ logger = logging.getLogger(__name__)
 class ExperienceStore:
     """自主经验库的持久化存储。"""
 
-    def __init__(self, path: Optional[Path] = None) -> None:
+    def __init__(self, path: Optional[Path] = None, max_items: Optional[int] = None) -> None:
         self.path = path or (
             Path(__file__).resolve().parent.parent / "state" / "experience_library.json"
         )
+        # 条目硬上限：超出淘汰最旧，防止文件/内存无限增长
+        self.max_items = max_items
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._data: dict[str, dict] = self._load()
+        # 启动时若已有状态文件超限，立即收敛（避免历史遗留文件一次性超量）
+        if self._enforce_max():
+            self.save()
 
     def _load(self) -> dict[str, dict]:
         if not self.path.exists():
@@ -62,9 +67,29 @@ class ExperienceStore:
             "created_at": now,
             "updated_at": now,
         }
+        self._enforce_max()
         self.save()
         logger.info("经验库新增 #%s [%s] %s", eid, category, title)
         return eid
+
+    def _enforce_max(self) -> int:
+        """条目数超上限时淘汰最旧条目（刚写入的最新一条不淘汰），返回淘汰数量。"""
+        if not self.max_items or len(self._data) <= self.max_items:
+            return 0
+        oldest_keys = sorted(
+            self._data, key=lambda k: self._data[k].get("updated_at", "")
+        )
+        removed = 0
+        for k in oldest_keys:
+            if len(self._data) <= self.max_items:
+                break
+            self._data.pop(k, None)
+            removed += 1
+        if removed:
+            logger.warning(
+                "经验库超上限 %d 条，已淘汰 %d 条最旧条目", self.max_items, removed
+            )
+        return removed
 
     def update(self, eid: str, **fields) -> bool:
         """按字段更新经验（category/title/content 可改），返回是否成功。"""

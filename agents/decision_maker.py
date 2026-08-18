@@ -179,6 +179,7 @@ class DecisionMaker:
         experience_context: str = "",
         open_orders_by_symbol: dict | None = None,
         min_margin_context: str = "",
+        last_round_feedback: str = "",
     ) -> TradingDecision:
         user_content = (
             "市场分析报告：\n"
@@ -192,6 +193,7 @@ class DecisionMaker:
             + (min_margin_context + "\n\n" if min_margin_context else "")
             + format_account_context(account, open_orders_by_symbol)
             + "\n\n"
+            + (last_round_feedback + "\n\n" if last_round_feedback else "")
             + "自主经验库（历史经验，若有相关内容请务必参考）：\n"
             + (experience_context if experience_context else "（经验库为空）")
             + "\n\n"

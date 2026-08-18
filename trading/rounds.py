@@ -117,3 +117,19 @@ class RuntimeState:
     def last_round_at(self) -> Optional[float]:
         """上一轮分析开始时刻（epoch 秒），无记录返回 None。"""
         return self._data.get("last_round_at")
+
+    def set_feedback(self, text: str) -> None:
+        """记录上一轮执行反馈（风控拦截 / 执行失败原因等），供下一轮决策者参考。
+
+        持久化到本地：系统重启后仍保留，避免模型因不知道上轮指令为何未成交
+        而重复犯错（例如开仓因保证金不足被拦截后，下轮仍按同样 margin 下单）。
+        """
+        if text:
+            self._data["last_feedback"] = text
+        else:
+            self._data.pop("last_feedback", None)
+        self.save()
+
+    def last_feedback(self) -> str:
+        """上一轮执行反馈文本；无记录返回空串。"""
+        return self._data.get("last_feedback", "")

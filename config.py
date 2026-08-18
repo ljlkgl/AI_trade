@@ -86,6 +86,10 @@ class Config:
         self.watch_max_age_hours = _get_int("WATCH_MAX_AGE_HOURS", 24)  # 小时
         # 操作理由列表中「其它类」条目的超时过期时长（小时），防止上下文无限膨胀
         self.thesis_max_age_hours = _get_int("THESIS_MAX_AGE_HOURS", 72)
+        # 操作理由列表条目硬上限：超出按「非持仓优先、最旧优先」淘汰，保证上下文有界
+        self.thesis_max_items = _get_int("THESIS_MAX_ITEMS", 50)
+        # 经验库条目硬上限：超出淘汰最旧，防止文件与内存无限增长
+        self.experience_max_items = _get_int("EXPERIENCE_MAX_ITEMS", 100)
         # 状态面板 HTTP 服务器：随 main.py 自动启动
         self.web_enabled = _get_bool("WEB_ENABLED", True)
         self.web_host = os.getenv("WEB_HOST", "127.0.0.1")

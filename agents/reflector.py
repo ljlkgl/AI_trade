@@ -57,6 +57,7 @@ class Reflector:
         account_context: str,
         experience_context: str,
         previous_context: Optional[str] = None,
+        risk_blocked: Optional[list[dict]] = None,
     ) -> Reflection:
         """复盘本轮并输出经验库操作。"""
         user_parts = [
@@ -67,6 +68,15 @@ class Reflector:
             "\n\n当前账户现状：\n", account_context,
             "\n\n当前自主经验库：\n", experience_context,
         ]
+        if risk_blocked:
+            user_parts.append(
+                "\n\n本轮被风控拦截的指令"
+                "（重要：若本轮未产生任何订单，请先确认是否因下述风控拦截所致，"
+                "不要把它误判为「系统静默不执行」）：\n"
+            )
+            user_parts.append(
+                json.dumps(risk_blocked, ensure_ascii=False, indent=2)[:1500]
+            )
         if previous_context:
             user_parts.extend(["\n\n上轮持仓假设（供对照）：\n", previous_context])
         user_parts.append(
