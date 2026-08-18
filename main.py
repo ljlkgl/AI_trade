@@ -39,7 +39,7 @@ from trading.hypothesis import ThesisStore
 from trading.market import MarketDataService
 from trading.news import NewsService
 from trading.risk import RiskManager, build_min_margin_context
-from trading.rounds import RoundLog
+from trading.rounds import RoundLog, RuntimeState
 from trading.watch import WatchStore
 
 logging.basicConfig(
@@ -137,6 +137,7 @@ class TradingSystem:
         self.experiences = ExperienceStore()
         self.watch_store = WatchStore(max_age_hours=config.watch_max_age_hours)
         self.round_log = RoundLog()
+        self.runtime = RuntimeState()
         self.symbols = config.symbols
         self._last_reflection: Optional[dict] = None
         self._web_controller: Optional[WebServerController] = None
@@ -178,6 +179,11 @@ class TradingSystem:
     def run_once(self) -> dict:
         """执行一轮完整的 行情→分析→决策→风控→执行→假设记录。"""
         logger.info("===== 开始一轮交易决策 @ %s =====", datetime.now().isoformat())
+        # 先持久化本轮开始时刻：程序中途关闭/崩溃后，下次启动可据此接续等待节奏
+        try:
+            self.runtime.mark_round_started()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("记录本轮开始时刻失败: %s", exc)
         result: dict = {
             "timestamp": datetime.now().isoformat(),
             "symbols": self.symbols,
@@ -687,6 +693,8 @@ class TradingSystem:
             self.interval_minutes, config.binance_testnet, config.dry_run,
             config.watch_enabled,
         )
+        # 程序恢复：若上一轮分析时间未到下一轮间隔，则接上等待（仅启动时执行一次）
+        self._resume_wait_if_needed()
         while True:
             started = time.time()
             try:
@@ -707,6 +715,35 @@ class TradingSystem:
             else:
                 logger.info("下一轮将在 %.0f 秒后进行", sleep_sec)
                 time.sleep(sleep_sec)
+
+    def _resume_wait_if_needed(self) -> None:
+        """程序关闭再开启后的恢复：接上上一轮的等待节奏。
+
+        若上一轮分析开始时刻距今仍未到下一轮分析时间（interval 未到点），
+        则继续等待剩余时长，而不是立即重新分析，从而延续修改前的决定；
+        已到点或无记录则直接开始新一轮。等待期间仍响应模型设定的唤醒条件。
+        """
+        last = self.runtime.last_round_at()
+        if last is None:
+            logger.info("无上一轮记录，直接开始新一轮分析")
+            return
+        interval_sec = self.interval_minutes * 60
+        remaining = interval_sec - (time.time() - last)
+        if remaining <= 0:
+            logger.info(
+                "上一轮分析于 %.0f 秒前，已到下一轮分析时间，直接开始",
+                interval_sec - remaining,
+            )
+            return
+        logger.info(
+            "程序恢复：上一轮分析于 %.0f 秒前，距下一轮还有 %.0f 秒，接上等待",
+            interval_sec - remaining, remaining,
+        )
+        if config.watch_enabled and self.watch_store.count() > 0:
+            if self._wait_for_trigger_or_sleep(remaining):
+                logger.info("唤醒条件触发，提前开始新一轮分析")
+        else:
+            time.sleep(remaining)
 
     def _wait_for_trigger_or_sleep(self, sleep_sec: float) -> bool:
         """等待 sleep_sec 秒，期间按 WATCH_CHECK_INTERVAL 轮询唤醒条件；满足则提前返回 True。"""

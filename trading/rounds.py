@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from pathlib import Path
 from typing import Any, Optional
 
@@ -73,3 +74,46 @@ class RoundLog:
             "thesis_count", "reflection", "error",
         )
         return {k: result.get(k) for k in keep_keys if k in result}
+
+
+class RuntimeState:
+    """运行时状态持久化（state/state.json），支持程序关闭再开启的恢复。
+
+    核心字段 last_round_at：上一轮分析开始时刻（epoch 秒）。
+    程序重启后据此计算距下一轮分析的剩余时间：若尚未到点则「接上等待」，
+    而不是立即重新分析，从而延续修改前的决定与节奏。
+    交易相关状态（挂单/持仓/操作理由列表/唤醒条件/轮次历史）本就各自持久化
+    或存于交易所，重启后按真实账户自动对齐，天然兼容修改前的决定。
+    """
+
+    def __init__(self, path: Optional[Path] = None) -> None:
+        self.path = path or (
+            Path(__file__).resolve().parent.parent / "state" / "state.json"
+        )
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._data: dict[str, Any] = self._load()
+
+    def _load(self) -> dict[str, Any]:
+        if not self.path.exists():
+            return {}
+        try:
+            with open(self.path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else {}
+        except (json.JSONDecodeError, OSError) as exc:
+            logger.warning("运行时状态文件损坏，重新初始化: %s", exc)
+            return {}
+
+    def save(self) -> None:
+        # 紧凑 JSON（无缩进/空格），占用存储较少
+        with open(self.path, "w", encoding="utf-8") as f:
+            json.dump(self._data, f, ensure_ascii=False, separators=(",", ":"))
+
+    def mark_round_started(self, now: Optional[float] = None) -> None:
+        """记录本轮分析开始时刻并持久化（中途崩溃后下次启动也能接续节奏）。"""
+        self._data["last_round_at"] = now if now is not None else time.time()
+        self.save()
+
+    def last_round_at(self) -> Optional[float]:
+        """上一轮分析开始时刻（epoch 秒），无记录返回 None。"""
+        return self._data.get("last_round_at")
