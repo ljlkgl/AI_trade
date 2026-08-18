@@ -30,7 +30,7 @@ def to_yahoo_symbol(binance_symbol: str) -> str:
 class NewsService:
     """抓取标的与宏观新闻，输出 markdown 上下文。"""
 
-    def __init__(self, article_limit: int = 10, global_limit: int = 10) -> None:
+    def __init__(self, article_limit: int = 15, global_limit: int = 15) -> None:
         self.article_limit = article_limit
         self.global_limit = global_limit
         self._yf = None
@@ -83,6 +83,8 @@ class NewsService:
             "crypto regulation SEC",
             "Federal Reserve interest rates",
             "Solana cryptocurrency",
+            # 地缘政治 / 宏观环境关键词：美国政策与地缘冲突都会影响加密市场
+            "America"
         ]
         all_news: list[dict] = []
         seen: set[str] = set()

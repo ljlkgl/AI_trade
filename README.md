@@ -1,6 +1,6 @@
 # TradeTool — 币安 BTC/ETH/SOL 永续合约 AI 交易系统
 
-提取自 [TradingAgents](../../TradingAgents) 的多 Agent 行情分析逻辑，实现为一个独立的、
+提取自 [TradingAgents](https://github.com/TauricResearch/TradingAgents) 的多 Agent 行情分析逻辑，实现为一个独立的、
 可部署至服务器的币安 USDT-M 永续合约交易系统。
 
 ## 核心特性

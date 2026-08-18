@@ -45,8 +45,9 @@ class WatchStore:
             return []
 
     def save(self) -> None:
+        # 紧凑 JSON（无缩进/空格），占用存储较少
         with self.path.open("w", encoding="utf-8") as f:
-            json.dump(self._data, f, ensure_ascii=False, indent=2)
+            json.dump(self._data, f, ensure_ascii=False, separators=(",", ":"))
 
     def replace(self, conditions: list[WakeCondition]) -> None:
         """用模型本轮输出的条件全量替换旧条件（空列表=清除全部）。"""

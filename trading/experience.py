@@ -39,8 +39,9 @@ class ExperienceStore:
             return {}
 
     def save(self) -> None:
+        # 紧凑 JSON（无缩进/空格），占用存储较少
         with open(self.path, "w", encoding="utf-8") as f:
-            json.dump(self._data, f, ensure_ascii=False, indent=2)
+            json.dump(self._data, f, ensure_ascii=False, separators=(",", ":"))
 
     # ---------- 增删改查 ----------
 

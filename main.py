@@ -39,6 +39,7 @@ from trading.hypothesis import ThesisStore
 from trading.market import MarketDataService
 from trading.news import NewsService
 from trading.risk import RiskManager, build_min_margin_context
+from trading.rounds import RoundLog
 from trading.watch import WatchStore
 
 logging.basicConfig(
@@ -135,6 +136,7 @@ class TradingSystem:
         self.theses = ThesisStore(max_age_hours=config.thesis_max_age_hours)
         self.experiences = ExperienceStore()
         self.watch_store = WatchStore(max_age_hours=config.watch_max_age_hours)
+        self.round_log = RoundLog()
         self.symbols = config.symbols
         self._last_reflection: Optional[dict] = None
 
@@ -678,7 +680,11 @@ class TradingSystem:
         while True:
             started = time.time()
             try:
-                self.run_once()
+                result = self.run_once()
+                try:
+                    self.round_log.append(result)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("记录轮次历史失败: %s", exc)
             except Exception as exc:  # noqa: BLE001
                 logger.exception("循环中出现未处理异常: %s", exc)
             elapsed = time.time() - started
@@ -744,6 +750,10 @@ def main() -> None:
     system = TradingSystem(interval_minutes=args.interval)
     if args.once:
         result = system.run_once()
+        try:
+            system.round_log.append(result)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("记录轮次历史失败: %s", exc)
         # 简要输出决策摘要
         print("\n===== 决策摘要 =====")
         print("市场评估:", result.get("market_assessment", "N/A")[:300])
