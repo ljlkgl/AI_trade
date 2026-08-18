@@ -203,6 +203,10 @@ def _fmt(v: Any, digits: int = 2) -> str:
 def _render(status: dict[str, Any]) -> str:
     h = html.escape
     rows: list[str] = []
+    # 预定义带引号的 HTML 标签片段，避免在 f-string 表达式内使用反斜杠
+    # （Python < 3.12 的 f-string 表达式不允许反斜杠）
+    algo_tag = '<span class="tag algo">algo</span>'
+    error_tag = ' <span class="tag neg">error</span> '
 
     # ---- 头部 ----
     rows.append(f"""<!DOCTYPE html>
@@ -293,7 +297,7 @@ def _render(status: dict[str, Any]) -> str:
                 f"<tr><td>{h(_fmt(o.get('symbol')))}</td>"
                 f"<td class='{side_cls}'>{h(side)}</td>"
                 f"<td>{h(_fmt(o.get('type')))}"
-                f"{'<span class=\"tag algo\">algo</span>' if is_algo else ''}</td>"
+                f"{algo_tag if is_algo else ''}</td>"
                 f"<td>{_fmt(o.get('price'), 6)}</td>"
                 f"<td>{_fmt(o.get('stopPrice'), 6)}</td>"
                 f"<td>{_fmt(o.get('origQty'), 4)}</td>"
@@ -379,7 +383,7 @@ def _render(status: dict[str, Any]) -> str:
         rows.append(f"<div style='margin-bottom:12px'>")
         rows.append(
             f"<div><b>{h(ts)}</b>"
-            f"{' <span class=\"tag neg\">error</span> ' + h(str(r.get('error'))) if r.get('error') else ''}"
+            f"{error_tag + h(str(r.get('error'))) if r.get('error') else ''}"
             f"</div>"
         )
         ma = r.get("market_assessment")
@@ -549,7 +553,7 @@ class WebServerController:
 
     def _clear_ctl(self) -> None:
         try:
-            self.ctl_path.write_text("{\"cmd\": null}", encoding="utf-8")
+            self.ctl_path.write_text('{"cmd": null}', encoding="utf-8")
         except OSError as exc:
             logger.warning("清除 web 控制命令失败: %s", exc)
 
