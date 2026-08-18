@@ -90,6 +90,8 @@ class Config:
         self.web_enabled = _get_bool("WEB_ENABLED", True)
         self.web_host = os.getenv("WEB_HOST", "127.0.0.1")
         self.web_port = _get_int("WEB_PORT", 8080)
+        # 状态面板访问密码（URL 以 ?password= 传递；校验失败则无响应，防止被探测）
+        self.web_password = os.getenv("WEB_PASSWORD", "114514")
 
     def validate(self) -> None:
         """启动前校验关键配置，缺失时给出明确错误。"""

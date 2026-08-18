@@ -19,11 +19,13 @@ import html
 import importlib
 import json
 import logging
+import socket
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Optional
+from urllib.parse import parse_qs, urlparse
 
 from config import config
 from trading.binance_client import BinanceClient
@@ -423,16 +425,30 @@ class Handler(BaseHTTPRequestHandler):
     collector: StatusCollector  # 类级共享
 
     def do_GET(self):  # noqa: N802
-        if self.path in ("/", "/index.html"):
+        parsed = urlparse(self.path)
+        # 访问密码校验：URL 以 ?password=xxx 传递，错误/缺失则无响应直接断开，防止被探测
+        if parse_qs(parsed.query).get("password", [""])[0] != config.web_password:
+            self.close_connection = True
+            try:
+                self.connection.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                self.connection.close()
+            except OSError:
+                pass
+            return
+        path = parsed.path
+        if path in ("/", "/index.html"):
             try:
                 status = self.collector.collect()
             except Exception as exc:  # noqa: BLE001
                 logger.exception("收集状态失败: %s", exc)
-                self._send(500, "text/plain; charset=utf-8", f"状态收集失败: {exc}")
+                self._send(500, "text/plain; charset=utf-8", f"状态收集失败: {exc}".encode("utf-8"))
                 return
             body = _render(status).encode("utf-8")
             self._send(200, "text/html; charset=utf-8", body)
-        elif self.path == "/api/status":
+        elif path == "/api/status":
             try:
                 status = self.collector.collect()
             except Exception as exc:  # noqa: BLE001
@@ -453,7 +469,12 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def log_message(self, fmt: str, *args) -> None:  # noqa: A003
-        logger.info("web: %s - %s", self.address_string(), fmt % args)
+        # 请求行形如 `GET /?password=xxx HTTP/1.1`，丢弃 query 避免访问密码进入日志
+        msg = fmt % args
+        parts = msg.split(" ", 2)
+        if len(parts) == 3 and "?" in parts[1]:
+            msg = f"{parts[0]} {parts[1].split('?', 1)[0]} {parts[2]}"
+        logger.info("web: %s - %s", self.address_string(), msg)
 
 
 def start_server(host: str = "127.0.0.1", port: int = 8080) -> ThreadingHTTPServer:
