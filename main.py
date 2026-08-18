@@ -236,6 +236,23 @@ class TradingSystem:
             for sym, orders in open_orders_by_symbol.items()
         }
 
+        # 账户日志旁一并输出未成交挂单摘要，便于人工/日志一眼确认当前挂单状态
+        pending_parts: list[str] = []
+        pending_total = 0
+        for sym in self.symbols:
+            for o in open_orders_by_symbol.get(sym, []):
+                pending_total += 1
+                otype = o.get("type") or "-"
+                oside = o.get("side") or "-"
+                opx = o.get("price") or o.get("stopPrice") or "-"
+                oqty = o.get("origQty") or "-"
+                algo = "[algo]" if o.get("is_algo") else ""
+                pending_parts.append(f"{sym} {oside} {otype}{algo} @{opx} x{oqty}")
+        if pending_parts:
+            logger.info("未成交挂单(%d): %s", pending_total, " | ".join(pending_parts))
+        else:
+            logger.info("未成交挂单: 无")
+
         # 2. 提前取价与精度（构建「最少初始保证金」上下文；后续风控校验复用）
         price_map: dict[str, float] = {}
         symbol_info_map = {}
