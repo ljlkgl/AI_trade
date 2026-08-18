@@ -16,8 +16,11 @@ from __future__ import annotations
 
 import argparse
 import html
+import importlib
 import json
 import logging
+import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Optional
@@ -102,47 +105,58 @@ class StatusCollector:
         if live is None:
             return self._fill_from_rounds(status)
 
-        # 实时价格
-        prices: dict[str, float] = {}
-        for sym in config.symbols:
+        # 实时拉取放入守护线程并限时：币安接口慢/失败时页面仍能快速返回（降级为快照）
+        live_data: dict[str, Any] = {}
+        done = threading.Event()
+
+        def _work() -> None:
             try:
-                prices[sym] = live.get_ticker_price(sym)
+                prices: dict[str, float] = {}
+                for sym in config.symbols:
+                    try:
+                        prices[sym] = live.get_ticker_price(sym)
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning("获取 %s 价格失败: %s", sym, exc)
+                live_data["prices"] = prices
+
+                account = live.get_account()
+                live_data["account"] = {
+                    "margin_balance": account.margin_balance,
+                    "available_balance": account.available_balance,
+                    "unrealized_pnl": account.unrealized_pnl,
+                    "positions": [
+                        {
+                            "symbol": p.symbol,
+                            "side": "LONG" if p.position_amt > 0 else "SHORT",
+                            "qty": abs(p.position_amt),
+                            "entry": p.entry_price,
+                            "mark": p.mark_price,
+                            "pnl": p.unrealized_pnl,
+                            "leverage": p.leverage,
+                            "liq": p.liquidation_price,
+                        }
+                        for p in account.positions
+                    ],
+                }
+                live_data["live"] = True
+
+                live_data["open_orders"] = {
+                    sym: _merge_open_orders(sym, live) for sym in config.symbols
+                }
             except Exception as exc:  # noqa: BLE001
-                logger.warning("获取 %s 价格失败: %s", sym, exc)
-        status["prices"] = prices
+                logger.warning("实时账户拉取异常: %s", exc)
+            finally:
+                done.set()
 
-        # 实时账户与持仓
-        try:
-            account = live.get_account()
-            status["account"] = {
-                "margin_balance": account.margin_balance,
-                "available_balance": account.available_balance,
-                "unrealized_pnl": account.unrealized_pnl,
-                "positions": [
-                    {
-                        "symbol": p.symbol,
-                        "side": "LONG" if p.position_amt > 0 else "SHORT",
-                        "qty": abs(p.position_amt),
-                        "entry": p.entry_price,
-                        "mark": p.mark_price,
-                        "pnl": p.unrealized_pnl,
-                        "leverage": p.leverage,
-                        "liq": p.liquidation_price,
-                    }
-                    for p in account.positions
-                ],
-            }
-            status["live"] = True
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("获取实时账户失败: %s", exc)
+        t = threading.Thread(target=_work, daemon=True)
+        t.start()
+        t.join(timeout=10)
+        if t.is_alive():
+            # 超时：放弃实时数据，快速降级为最近一轮快照
+            logger.warning("实时账户拉取超时，状态面板使用最近一轮快照")
+            return self._fill_from_rounds(status)
 
-        # 实时未成交挂单
-        try:
-            status["open_orders"] = {
-                sym: _merge_open_orders(sym, live) for sym in config.symbols
-            }
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("获取实时挂单失败: %s", exc)
+        status.update(live_data)
 
         # 本地状态
         status["theses"] = _read_json("theses.json")
@@ -438,6 +452,142 @@ class Handler(BaseHTTPRequestHandler):
         logger.info("web: %s - %s", self.address_string(), fmt % args)
 
 
+def start_server(host: str = "127.0.0.1", port: int = 8080) -> ThreadingHTTPServer:
+    """启动 HTTP 服务器（非阻塞，需调用方自行 serve_forever 或另起线程）。"""
+    collector = StatusCollector()
+    Handler.collector = collector
+    return ThreadingHTTPServer((host, port), Handler)
+
+
+class WebServerController:
+    """管理状态面板服务器的生命周期，供主进程内嵌调用。
+
+    - 随时终止：监听控制文件 state/web_ctl.json，写入 {"cmd":"stop"} 即停止
+      （"start" 重新启动，"restart" 重载并重启），无需重启主进程；
+    - 热更新：周期检测 web.py 文件修改时间，变化后自动 importlib.reload
+      并重启服务器，主进程运行中修改 web.py 保存即可立即生效。
+    """
+
+    def __init__(
+        self,
+        host: str = "127.0.0.1",
+        port: int = 8080,
+        ctl_path: Optional[Path] = None,
+        web_path: Optional[Path] = None,
+        check_interval: float = 2.0,
+    ) -> None:
+        self.host = host
+        self.port = port
+        self.ctl_path = ctl_path or (_STATE_DIR / "web_ctl.json")
+        self.web_path = web_path or (Path(__file__).resolve())
+        self.check_interval = check_interval
+        self._server: Optional[ThreadingHTTPServer] = None
+        self._mtime = self._file_mtime(self.web_path)
+        self._running = False
+        self._thread: Optional[threading.Thread] = None
+
+    # ---------- 生命周期 ----------
+
+    def start(self) -> None:
+        """启动监听线程（守护线程，不影响主进程交易循环）。"""
+        if self._running:
+            return
+        self._running = True
+        self._ensure_server()
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        """终止监听线程并关闭服务器。"""
+        self._running = False
+        self._shutdown_server()
+
+    def _loop(self) -> None:
+        while self._running:
+            time.sleep(self.check_interval)
+            try:
+                self._apply_control(self._read_ctl())
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("处理 web 控制命令失败: %s", exc)
+            try:
+                self._check_reload()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("web 热更新检测失败: %s", exc)
+
+    # ---------- 服务器管理 ----------
+
+    def _ensure_server(self) -> None:
+        if self._server is not None:
+            return
+        server = start_server(self.host, self.port)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self._server = server
+        logger.info("状态面板已启动: http://%s:%d", self.host, self.port)
+
+    def _shutdown_server(self) -> None:
+        if self._server is None:
+            return
+        try:
+            self._server.shutdown()
+            self._server.server_close()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("关闭状态面板失败: %s", exc)
+        self._server = None
+        logger.info("状态面板已停止")
+
+    # ---------- 外部控制（控制文件） ----------
+
+    def _read_ctl(self) -> Optional[str]:
+        if not self.ctl_path.exists():
+            return None
+        try:
+            with open(self.ctl_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data.get("cmd") if isinstance(data, dict) else None
+        except (json.JSONDecodeError, OSError):
+            return None
+
+    def _clear_ctl(self) -> None:
+        try:
+            self.ctl_path.write_text("{\"cmd\": null}", encoding="utf-8")
+        except OSError as exc:
+            logger.warning("清除 web 控制命令失败: %s", exc)
+
+    def _apply_control(self, cmd: Optional[str]) -> None:
+        if cmd not in ("stop", "start", "restart"):
+            return
+        logger.info("收到状态面板控制命令: %s", cmd)
+        if cmd == "stop":
+            self._shutdown_server()
+        elif cmd == "start":
+            self._ensure_server()
+        elif cmd == "restart":
+            self._reload_and_restart()
+        self._clear_ctl()
+
+    # ---------- 热更新（web.py 代码变更自动 reload） ----------
+
+    @staticmethod
+    def _file_mtime(path: Path) -> Optional[int]:
+        try:
+            return path.stat().st_mtime_ns
+        except OSError:
+            return None
+
+    def _check_reload(self) -> None:
+        mtime = self._file_mtime(self.web_path)
+        if mtime is None or mtime == self._mtime:
+            return
+        logger.info("检测到 web.py 已更新，自动重载并重启状态面板...")
+        self._reload_and_restart()
+        self._mtime = mtime
+
+    def _reload_and_restart(self) -> None:
+        importlib.reload(importlib.import_module("web"))
+        self._shutdown_server()
+        self._ensure_server()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="交易系统状态 HTTP 服务器")
     parser.add_argument("--host", default="127.0.0.1")
@@ -445,9 +595,7 @@ def main() -> None:
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
-    collector = StatusCollector()
-    Handler.collector = collector
-    server = ThreadingHTTPServer((args.host, args.port), Handler)
+    server = start_server(args.host, args.port)
     print(f"状态面板已启动: http://{args.host}:{args.port}")
     print("按 Ctrl+C 停止")
     try:

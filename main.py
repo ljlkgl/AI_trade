@@ -139,6 +139,16 @@ class TradingSystem:
         self.round_log = RoundLog()
         self.symbols = config.symbols
         self._last_reflection: Optional[dict] = None
+        self._web_controller: Optional[WebServerController] = None
+        if config.web_enabled:
+            from web import WebServerController
+
+            self._web_controller = WebServerController(
+                host=config.web_host, port=config.web_port
+            )
+            self._web_controller.start()
+        else:
+            logger.info("状态面板未启用（WEB_ENABLED=false）")
 
     def _init_hedge_mode(self) -> bool:
         """检查账户持仓模式；单向则尝试切换为双向持仓。
