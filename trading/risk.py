@@ -119,6 +119,7 @@ class RiskManager:
         min_notional: Optional[float] = None,
         min_margin: Optional[float] = None,
         max_sl_risk_ratio: Optional[float] = None,
+        max_total_sl_risk_ratio: Optional[float] = None,
         lock_store=None,
     ) -> None:
         self.max_position_ratio = (
@@ -138,6 +139,17 @@ class RiskManager:
         )
         # 初始风险额度锁（RiskLockStore），用于校验 SET_SL_TP 不扩大锁定亏损
         self.lock_store = lock_store
+        # 全局止损绝对风险总上限：所有币种已锁定风险之和 ≤ 权益×此比例。
+        # 用于开新单前合计当前风险敞口、检查剩余预算（任务一B/六）。
+        self.max_total_sl_risk_ratio = (
+            max_total_sl_risk_ratio
+            if max_total_sl_risk_ratio is not None
+            else (
+                config.max_total_sl_risk_ratio
+                if hasattr(config, "max_total_sl_risk_ratio")
+                else 0.05
+            )
+        )
 
     # ---------- 辅助 ----------
 
@@ -338,31 +350,119 @@ class RiskManager:
 
         return RiskCheckResult(ok=len(errors) == 0, errors=errors)
 
+    def fit_margin_to_budget(
+        self,
+        instruction: TradeInstruction,
+        account: AccountInfo,
+        symbol_info: SymbolInfo,
+        mark_price: float,
+    ) -> Optional[float]:
+        """开仓被「止损绝对风险超限」拦截时，反解出预算边界内允许的最大 margin。
+
+        目标：|入场−止损| × 数量 ≤ 风险预算，其中 数量 = margin × 杠杆 / 入场价。
+        反解得 margin ≤ 预算 × 入场价 / (杠杆 × |入场−止损|)。
+        - 预算边界：单品种上限（权益×max_sl_risk_ratio）与锁定额度取较小者，再叠加已有持仓占用；
+        - 全局预算：所有币种已锁定风险之和 ≤ 权益×max_total_sl_risk_ratio（防止多单挤占预算）；
+        - 可用余额：margin 不得超额可用余额（动态按账户规模缩放头寸）。
+
+        返回预算内最大 margin；若无法满足（预算≤0 或失真）返回 None，调用方保持拦截。
+        """
+        if instruction.action not in (OrderAction.OPEN_LONG, OrderAction.OPEN_SHORT):
+            return None
+        leverage = instruction.leverage or 1
+        entry = instruction.price or mark_price
+        sl = instruction.stop_loss
+        if not entry or entry <= 0 or not sl or leverage <= 0:
+            return None
+        # 预算边界：权益×单品种比例 与 该币种锁定额度 取较小者
+        equity = account.margin_balance if account.margin_balance > 0 else account.total_balance
+        budget = equity * self.max_sl_risk_ratio
+        locked = self.lock_store.get(instruction.symbol) if self.lock_store else None
+        locked_u = (locked or {}).get("locked_risk_usdt") if locked else None
+        if locked_u:
+            budget = min(budget, locked_u)
+        # 全局预算：所有币种已锁定风险之和 ≤ 权益×总比例，剩余预算分给本币种
+        if self.lock_store:
+            other_locked = 0.0
+            for sym in self.lock_store.all_keys():
+                if sym == instruction.symbol:
+                    continue
+                other_locked += (self.lock_store.get(sym) or {}).get("locked_risk_usdt", 0.0)
+            global_cap = equity * self.max_total_sl_risk_ratio
+            budget = min(budget, max(0.0, global_cap - other_locked))
+        # 已有持仓占用本币种预算
+        pos = self.current_position(account, instruction.symbol)
+        occupied = 0.0
+        if pos and pos.position_amt:
+            occupied = self._abs_risk(pos.entry_price, sl, abs(pos.position_amt))
+        remaining_risk = budget - occupied
+        if remaining_risk <= 0:
+            return None
+        distance = abs(float(entry) - float(sl))
+        if distance <= 0:
+            return None
+        # 反解 margin：数量 = margin×杠杆/入场价，风险 = 数量×距离 ≤ remaining_risk
+        max_margin = remaining_risk * entry / (leverage * distance)
+        # 动态缩放：margin 不得超额可用余额（账户规模自适配）
+        avail = account.available_balance
+        if avail is not None and avail > 0:
+            max_margin = min(max_margin, avail)
+        if max_margin <= 0:
+            return None
+        return float(max_margin)
+
     def validate_decision(
         self,
         instructions: list[TradeInstruction],
         account: AccountInfo,
         price_map: dict[str, float],
         symbol_info_map: dict[str, SymbolInfo],
+        auto_downgrade: bool = True,
     ) -> tuple[list[TradeInstruction], list[RiskCheckResult]]:
-        """校验整个决策。返回 (通过的指令, 校验结果列表)。"""
-        passed: list[TradeInstruction] = []
+        """校验整个决策。返回 (通过的指令, 校验结果列表)。
+
+        auto_downgrade=True（默认）：当开仓因「止损绝对风险超限」被拒时，尝试把 margin
+        自动缩到预算边界内重新提交（自动降档重提），而不只是拦截——避免错过入场窗口。
+        若降档后仍不满足其它硬约束（如低于最少保证金/名义价值/止损方向），保持拦截。
+        """
         results: list[RiskCheckResult] = []
+        # 先整体校验一次，收集被拒的开仓（供降档重提）
+        initial: list[TradeInstruction] = []
         for ins in instructions:
             mark = price_map.get(ins.symbol, 0.0)
             info = symbol_info_map.get(ins.symbol)
             if mark <= 0 or info is None:
-                results.append(
-                    RiskCheckResult(ok=False, errors=[f"{ins.symbol}: 缺少标记价格或交易对信息"])
-                )
+                results.append(RiskCheckResult(ok=False, errors=[f"{ins.symbol}: 缺少标记价格或交易对信息"]))
                 continue
+            initial.append(ins)
+
+        passed: list[TradeInstruction] = []
+        for ins in initial:
+            mark = price_map.get(ins.symbol, 0.0)
+            info = symbol_info_map.get(ins.symbol)
             res = self.validate_instruction(ins, account, info, mark)
-            results.append(res)
             if res.ok:
                 passed.append(ins)
-            else:
-                logger.warning(
-                    "指令被风控拦截 %s %s: %s",
-                    ins.symbol, ins.action, "; ".join(res.errors),
-                )
+                results.append(res)
+                continue
+            # 仅对「开仓因止损绝对风险超限被拒」做自动降档重提
+            if auto_downgrade and ins.action in (OrderAction.OPEN_LONG, OrderAction.OPEN_SHORT):
+                fit = self.fit_margin_to_budget(ins, account, info, mark)
+                if fit is not None and ins.margin is not None and fit < ins.margin:
+                    fitted = ins.model_copy(update={"margin": fit})
+                    res2 = self.validate_instruction(fitted, account, info, mark)
+                    if res2.ok:
+                        logger.info(
+                            "%s %s 止损绝对风险超限，自动降档 margin %.6g→%.6g 重提成功",
+                            ins.symbol, ins.action.value, ins.margin, fit,
+                        )
+                        passed.append(fitted)
+                        results.append(RiskCheckResult(
+                            ok=True,
+                            errors=[f"自动降档重提：margin {ins.margin:.6g}→{fit:.6g}（止损绝对风险缩到预算内）"],
+                        ))
+                        continue
+            # 保持拦截
+            results.append(res)
+            logger.warning("指令被风控拦截 %s %s: %s", ins.symbol, ins.action, "; ".join(res.errors))
         return passed, results

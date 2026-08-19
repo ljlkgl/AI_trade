@@ -252,53 +252,190 @@ def _render(status: dict[str, Any]) -> str:
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta http-equiv="refresh" content="30">
-<title>交易系统状态</title>
+<title>交易系统状态 - AI 永续合约</title>
 <style>
-  body {{ font-family: "Segoe UI", "Microsoft YaHei", sans-serif; margin: 0; background: #0f1420; color: #dfe6f0; }}
-  header {{ padding: 16px 24px; background: #161d2e; border-bottom: 1px solid #243049; }}
-  header h1 {{ margin: 0; font-size: 20px; }}
-  header .meta {{ margin-top: 6px; font-size: 13px; color: #8ba0bd; }}
-  .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(420px, 1fr)); gap: 16px; padding: 20px 24px; }}
-  .card {{ background: #161d2e; border: 1px solid #243049; border-radius: 10px; padding: 14px 16px; }}
-  .card h2 {{ margin: 0 0 10px; font-size: 15px; color: #7cc4ff; border-left: 3px solid #2f81f7; padding-left: 8px; }}
+  /* ===== Windows 11 Fluent 主题 ===== */
+  * {{ box-sizing: border-box; }}
+  html, body {{ height: 100%; }}
+  body {{
+    font-family: "Segoe UI", "Segoe UI Variable", "Microsoft YaHei", sans-serif;
+    margin: 0; background: #f3f3f3; color: #1b1b1b; font-size: 14px;
+    overflow: hidden;
+  }}
+  .win {{
+    display: flex; flex-direction: column;
+    height: 100vh; width: 100vw;
+  }}
+
+  /* ---- 标题栏 ---- */
+  .titlebar {{
+    display: flex; align-items: center; gap: 10px;
+    height: 44px; padding: 0 0 0 14px;
+    background: linear-gradient(#ffffff, #f6f6f6);
+    border-bottom: 1px solid #e2e2e2;
+    user-select: none; flex-shrink: 0;
+  }}
+  .app-icon {{
+    width: 18px; height: 18px; flex-shrink: 0;
+    background: linear-gradient(135deg, #0078d4 0 55%, #78d4ff 55% 100%);
+    border-radius: 4px;
+  }}
+  .title-text {{ font-size: 12px; font-weight: 600; color: #1b1b1b; white-space: nowrap; }}
+  .title-meta {{ font-size: 11px; color: #797979; margin-left: 4px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
+  .title-controls {{ margin-left: auto; display: flex; height: 100%; }}
+  .wc {{ width: 46px; height: 100%; display: flex; align-items: center; justify-content: center;
+        color: #1b1b1b; font-size: 11px; cursor: default; font-family: "Segoe MDL2 Assets","Segoe UI Symbol"; }}
+  .wc:hover {{ background: rgba(0,0,0,.06); }}
+  .wc.close:hover {{ background: #c42b1c; color: #fff; }}
+
+  /* ---- 菜单栏 ---- */
+  .menubar {{
+    display: flex; align-items: center; gap: 2px;
+    height: 32px; padding: 0 8px; background: #ffffff;
+    border-bottom: 1px solid #e2e2e2; flex-shrink: 0;
+    font-size: 13px;
+  }}
+  .menu-item {{ padding: 3px 10px; border-radius: 4px; cursor: default; color: #2a2a2a; }}
+  .menu-item:hover {{ background: #e8f0fb; }}
+
+  /* ---- 主体：左侧导航 + 内容 ---- */
+  .body {{ display: flex; flex: 1; min-height: 0; }}
+  .nav {{
+    width: 200px; flex-shrink: 0; overflow-y: auto; padding: 10px 8px;
+    background: #f3f3f3; border-right: 1px solid #e5e5e5;
+  }}
+  .nav-head {{
+    font-size: 11px; color: #7a7a7a; letter-spacing: .4px;
+    padding: 6px 10px 4px; text-transform: uppercase;
+  }}
+  .nav a {{
+    display: block; padding: 7px 12px; margin: 1px 0; border-radius: 6px;
+    color: #333; text-decoration: none; font-size: 13px;
+  }}
+  .nav a:hover {{ background: #e7e7e7; }}
+  .nav a .cnt {{
+    float: right; font-size: 11px; color: #0078d4;
+    background: #e6f1fb; border-radius: 9px; padding: 0 7px; line-height: 16px;
+  }}
+  .main {{ flex: 1; overflow-y: auto; padding: 20px 24px; }}
+  .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(420px, 1fr)); gap: 16px; align-items: start; }}
+  .card {{
+    background: #ffffff; border: 1px solid #e5e5e5; border-radius: 8px;
+    box-shadow: 0 1px 2px rgba(0,0,0,.04);
+  }}
+  .card > .c-head {{
+    display: flex; align-items: center; gap: 8px;
+    padding: 10px 14px; border-bottom: 1px solid #f0f0f0;
+  }}
+  .card h2 {{ margin: 0; font-size: 13px; font-weight: 600; color: #1b1b1b; }}
+  .c-bar {{ width: 3px; height: 16px; background: #0078d4; border-radius: 2px; }}
+  .c-body {{ padding: 6px 10px 10px; }}
+
   table {{ width: 100%; border-collapse: collapse; font-size: 13px; }}
-  th, td {{ text-align: left; padding: 6px 8px; border-bottom: 1px solid #1f2a40; }}
-  th {{ color: #8ba0bd; font-weight: 500; }}
-  .pos {{ color: #3ddc84; }} .neg {{ color: #ff5c6c; }}
+  th, td {{ text-align: left; padding: 6px 8px; border-bottom: 1px solid #f2f2f2; }}
+  th {{ color: #5b5b5b; font-weight: 600; font-size: 12px; }}
+  tr:hover td {{ background: #f7f9fb; }}
+  .pos {{ color: #0a7a2f; font-weight: 600; }} .neg {{ color: #c42b1c; font-weight: 600; }}
   .tag {{ display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 12px; }}
-  .tag.long {{ background: #123524; color: #3ddc84; }} .tag.short {{ background: #3a1620; color: #ff5c6c; }}
-  .tag.algo {{ background: #2a2a12; color: #e0c34c; }}
-  .muted {{ color: #6b7f9c; font-size: 12px; }}
+  .tag.long {{ background: #dff5e3; color: #0a7a2f; }} .tag.short {{ background: #fde2de; color: #c42b1c; }}
+  .tag.algo {{ background: #fff3cf; color: #8a5a00; }}
+  .muted {{ color: #7a7a7a; font-size: 12px; }}
   .wrap {{ word-break: break-all; white-space: pre-wrap; }}
-  .child {{ padding-left: 22px !important; color: #a8b8cf; }}
+  .child {{ padding-left: 22px !important; color: #555; }}
   ul {{ margin: 4px 0; padding-left: 18px; }}
   li {{ margin: 3px 0; }}
+  section {{ scroll-margin-top: 12px; }}
+
+  /* ---- 状态栏 ---- */
+  .statusbar {{
+    display: flex; align-items: center; gap: 16px;
+    height: 28px; padding: 0 14px; background: #ffffff;
+    border-top: 1px solid #e2e2e2; flex-shrink: 0;
+    font-size: 12px; color: #555;
+  }}
+  .sb-label {{ color: #7a7a7a; }}
+  .pulse {{ display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: #0a7a2f; margin-right: 6px; }}
+
+  /* ===== 手机端适配（≤768px） ===== */
+  @media (max-width: 768px) {{
+    .title-meta {{ display: none; }}
+    .menubar {{ display: none; }}
+    .title-text {{ font-size: 13px; }}
+    .wc {{ width: 40px; }}
+    .body {{ flex-direction: column; }}
+    /* 左侧导航改为顶部横向滚动条 */
+    .nav {{
+      width: 100%; flex-direction: row; flex-wrap: nowrap;
+      overflow-x: auto; padding: 6px 8px; gap: 2px;
+      border-right: none; border-bottom: 1px solid #e5e5e5;
+      -webkit-overflow-scrolling: touch;
+    }}
+    .nav-head {{ display: inline-block; flex-shrink: 0; padding: 6px 6px; }}
+    .nav a {{ display: inline-block; white-space: nowrap; flex-shrink: 0; padding: 6px 10px; }}
+    .main {{ padding: 12px; }}
+    .grid {{ grid-template-columns: 1fr; gap: 12px; }}
+    .c-body {{ padding: 4px 8px 8px; }}
+    th, td {{ padding: 6px 6px; font-size: 12px; }}
+    .statusbar {{ flex-wrap: wrap; height: auto; padding: 6px 12px; gap: 6px 14px; font-size: 11px; }}
+    .statusbar .sb-label:last-child {{ display: none; }}
+    section {{ scroll-margin-top: 8px; }}
+  }}
 </style>
 </head>
 <body>
-<header>
-  <h1>币安永续合约 AI 交易系统 · 状态面板</h1>
-  <div class="meta">
-    时间: {h(_fmt(status.get('now')))} ·
-    测试网: {'是' if status.get('testnet') else '否'} ·
-    DRY_RUN: {'是' if status.get('dry_run') else '否'} ·
-    标的: {h(', '.join(status.get('symbols', [])))}
-    {' · <span class="muted">' + h(status['note']) + '</span>' if status.get('note') else ''}
+<div class="win">
+  <div class="titlebar">
+    <div class="app-icon"></div>
+    <div class="title-text">AI 永续合约交易系统</div>
+    <div class="title-meta">
+      时间: {h(_fmt(status.get('now')))} · 测试网: {'是' if status.get('testnet') else '否'} ·
+      DRY_RUN: {'是' if status.get('dry_run') else '否'} ·
+      标的: {h(', '.join(status.get('symbols', [])))}
+    </div>
+    <div class="title-controls">
+      <div class="wc">&#xE921;</div>
+      <div class="wc">&#xE922;</div>
+      <div class="wc close">&#xE8BB;</div>
+    </div>
   </div>
-</header>
-<div class="grid">""")
+  <div class="menubar">
+    <div class="menu-item">文件</div>
+    <div class="menu-item">视图</div>
+    <div class="menu-item">工具</div>
+    <div class="menu-item">帮助</div>
+  </div>
+  <div class="body">
+  <nav class="nav">
+    <div class="nav-head">账户</div>
+    <a href="#acc">账户概况</a>
+    <div class="nav-head">持仓</div>
+    <a href="#positions">持仓明细</a>
+    <div class="nav-head">订单</div>
+    <a href="#orders">未成交挂单</a>
+    <div class="nav-head">行情</div>
+    <a href="#prices">当前价格</a>
+    <div class="nav-head">策略</div>
+    <a href="#theses">操作理由<span class="cnt">{len(status.get('theses') or [])}</span></a>
+    <a href="#watch">唤醒条件<span class="cnt">{len(status.get('watch') or [])}</span></a>
+    <div class="nav-head">日志</div>
+    <a href="#rounds">最近轮次</a>
+  </nav>
+  <main class="main">
+  <div class="grid">
+  {' <span class="muted">' + h(status['note']) + '</span>' if status.get('note') else ''}""")
 
     # ---- 账户概况 ----
     acc = status.get("account") or {}
     positions = acc.get("positions") or []
-    rows.append(f"""<div class="card"><h2>账户概况</h2>
+    rows.append(f"""<section id="acc" class="card"><div class="c-head"><span class="c-bar"></span><h2>账户概况</h2></div><div class="c-body">
 <table>
 <tr><th>权益(margin_balance)</th><td>{_fmt(acc.get('margin_balance'))} USDT</td></tr>
 <tr><th>可用余额</th><td>{_fmt(acc.get('available_balance'))} USDT</td></tr>
 <tr><th>未实现盈亏</th><td class="{('pos' if (acc.get('unrealized_pnl') or 0) >= 0 else 'neg')}">{_fmt(acc.get('unrealized_pnl'))} USDT</td></tr>
 <tr><th>持仓数量</th><td>{len(positions)}</td></tr>
-</table></div>""")
+</table></div></section>""")
 
     # ---- 持仓明细 ----
     if positions:
@@ -319,9 +456,9 @@ def _render(status: dict[str, Any]) -> str:
                 f"<td>{_fmt(p.get('liq'), 6)}</td></tr>"
             )
         pr.append("</table>")
-        rows.append(f"<div class='card'><h2>持仓明细</h2>{''.join(pr)}</div>")
+        rows.append(f"<section id='positions' class='card'><div class='c-head'><span class='c-bar'></span><h2>持仓明细</h2></div><div class='c-body'>{''.join(pr)}</div></section>")
     else:
-        rows.append("<div class='card'><h2>持仓明细</h2><p class='muted'>当前无持仓</p></div>")
+        rows.append("<section id='positions' class='card'><div class='c-head'><span class='c-bar'></span><h2>持仓明细</h2></div><div class='c-body'><p class='muted'>当前无持仓</p></div></section>")
 
     # ---- 未成交挂单 ----
     oo = status.get("open_orders") or {}
@@ -343,9 +480,9 @@ def _render(status: dict[str, Any]) -> str:
                 f"<td>{h(_fmt(o.get('status')))}</td></tr>"
             )
         orows.append("</table>")
-        rows.append(f"<div class='card'><h2>未成交挂单</h2>{''.join(orows)}</div>")
+        rows.append(f"<section id='orders' class='card'><div class='c-head'><span class='c-bar'></span><h2>未成交挂单</h2></div><div class='c-body'>{''.join(orows)}</div></section>")
     else:
-        rows.append("<div class='card'><h2>未成交挂单</h2><p class='muted'>当前无未成交挂单</p></div>")
+        rows.append("<section id='orders' class='card'><div class='c-head'><span class='c-bar'></span><h2>未成交挂单</h2></div><div class='c-body'><p class='muted'>当前无未成交挂单</p></div></section>")
 
     # ---- 当前价格 ----
     prices = status.get("prices") or {}
@@ -354,11 +491,11 @@ def _render(status: dict[str, Any]) -> str:
         for sym, px in prices.items():
             prows.append(f"<tr><td>{h(sym)}</td><td>{_fmt(px, 6)}</td></tr>")
         prows.append("</table>")
-        rows.append(f"<div class='card'><h2>当前价格</h2>{''.join(prows)}</div>")
+        rows.append(f"<section id='prices' class='card'><div class='c-head'><span class='c-bar'></span><h2>当前价格</h2></div><div class='c-body'>{''.join(prows)}</div></section>")
 
     # ---- 操作理由列表 ----
     theses = status.get("theses") or []
-    rows.append(f"<div class='card'><h2>操作理由列表（{len(theses)} 条）</h2>")
+    rows.append(f"<section id='theses' class='card'><div class='c-head'><span class='c-bar'></span><h2>操作理由列表（{len(theses)} 条）</h2></div><div class='c-body'>")
     if theses:
         by_id = {t.get("id"): t for t in theses}
         # 父子层级：先顶层，再递归展示子节点
@@ -389,11 +526,11 @@ def _render(status: dict[str, Any]) -> str:
         rows.append("".join(srows))
     else:
         rows.append("<p class='muted'>当前无进行中操作理由</p>")
-    rows.append("</div>")
+    rows.append("</div></section>")
 
     # ---- 唤醒条件 ----
     watch = status.get("watch") or []
-    rows.append(f"<div class='card'><h2>唤醒条件（{len(watch)} 个）</h2>")
+    rows.append(f"<section id='watch' class='card'><div class='c-head'><span class='c-bar'></span><h2>唤醒条件（{len(watch)} 个）</h2></div><div class='c-body'>")
     if watch:
         wrows = ["<table><tr><th>币种</th><th>条件</th><th>值</th><th>过期时间</th></tr>"]
         for w in watch:
@@ -407,11 +544,11 @@ def _render(status: dict[str, Any]) -> str:
         rows.append("".join(wrows))
     else:
         rows.append("<p class='muted'>无唤醒条件</p>")
-    rows.append("</div>")
+    rows.append("</div></section>")
 
     # ---- 最近轮次 ----
     rounds = status.get("rounds") or []
-    rows.append(f"<div class='card'><h2>最近轮次（最近 {len(rounds)} 轮）</h2>")
+    rows.append(f"<section id='rounds' class='card'><div class='c-head'><span class='c-bar'></span><h2>最近轮次（最近 {len(rounds)} 轮）</h2></div><div class='c-body'>")
     if not rounds:
         rows.append("<p class='muted'>暂无轮次记录</p>")
     for r in rounds:
@@ -454,7 +591,19 @@ def _render(status: dict[str, Any]) -> str:
         rows.append("</div>")
     rows.append("</div>")
 
-    rows.append("</div></body></html>")
+    rows.append("</section>")
+
+    rows.append(f"""  </div>
+  </main>
+  </div>
+  <div class="statusbar">
+    <span><span class="pulse"></span>运行中</span>
+    <span><span class="sb-label">自动刷新:</span> 30 秒</span>
+    <span><span class="sb-label">当前时间:</span> {h(_fmt(status.get('now')))}</span>
+    <span class="sb-label" style="margin-left:auto">AI 永续合约交易系统 · 状态面板</span>
+  </div>
+</div>
+</body></html>""")
     return "\n".join(rows)
 
 

@@ -29,7 +29,10 @@ from agents.confirmer import Confirmer
 from agents.decision_maker import DecisionMaker, format_account_context
 from agents.llm import AllLLMUnavailable, LLMClient
 from agents.market_analyst import MarketAnalyst
-from agents.schemas import ConfirmationAction, ExperienceAction, OrderAction, ThesisAction
+from agents.schemas import (
+    ConfirmationAction, ExperienceAction, OrderAction,
+    ThesisAction, TradingDecision, WakeCondition,
+)
 from config import config
 from trading.analyst_state import AnalystStateStore
 from trading.binance_client import BinanceClient
@@ -309,6 +312,44 @@ class TradingSystem:
             except Exception as exc:  # noqa: BLE001
                 logger.warning("操作理由列表清理失败: %s", exc)
         thesis_context = self.theses.render_context()
+
+        # 二-状态同步：HOLD/计划挂单状态核对。
+        # 理由列表里 kind=limit_order 的条目标记了「计划挂单」，但交易所实际未成交挂单中
+        # 可能根本没有对应订单（例如下单被风控拦截、或从未成功提交）。这类"计划 vs 实际"
+        # 不一致会导致决策者继续假设挂单存在（如"维持 ETH 限价 1910 挂单"），造成回踩
+        # 入场被静默丢失。这里逐条核对：绑定 order_id 缺失、或绑定单号已不在存活挂单中的
+        # 挂单理由，一律注入告警到决策上下文，提示决策者核实/重挂/更新理由。
+        try:
+            live_ids_now = _live_open_order_ids(open_orders_by_symbol)
+            ghost_orders = []
+            for thesis in self.theses.all():
+                if thesis.get("kind") != "limit_order":
+                    continue
+                if not thesis.get("symbol"):
+                    continue
+                bound_id = thesis.get("order_id")
+                if not bound_id or str(bound_id) not in live_ids_now:
+                    ghost_orders.append(thesis)
+            if ghost_orders:
+                alert = "\n\n## 计划挂单状态告警（理由列表 vs 交易所实际订单不一致）"
+                alert += (
+                    "\n以下 limit_order 理由在交易所未成交挂单中**找不到对应实际订单**"
+                    "（无绑定单号，或绑定单号已不复存活）。决策者不应再假设这些挂单仍然存在；"
+                    "请核实情况并决定：重新挂单 / 按当前行情调整 / 更新或删除该理由："
+                )
+                for t in ghost_orders:
+                    alert += (
+                        f"\n- [{t.get('id')}] {t.get('symbol')} @ "
+                        f"{t.get('entry_price')}"
+                        f"（方向: {t.get('direction')}；绑定单号: {t.get('order_id')}）"
+                    )
+                logger.warning(
+                    "计划挂单状态核对：发现 %d 条理由在交易所无对应实际订单", len(ghost_orders)
+                )
+                thesis_context += alert
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("计划挂单状态核对失败: %s", exc)
+
         result["thesis_context"] = thesis_context
 
         # 4. 市场上下文（多币种多周期）+ 新闻
@@ -384,9 +425,29 @@ class TradingSystem:
         except AllLLMUnavailable as exc:
             return self._handle_llm_outage(exc, result)
         except Exception as exc:  # noqa: BLE001
-            logger.error("决策失败: %s", exc)
-            result["error"] = f"决策失败: {exc}"
-            return result
+            # 保守默认：决策解析失败（重试后仍失败）时，维持原状继续本轮，
+            # 不产生任何指令、不触碰操作理由、保留现有唤醒条件——避免整轮被丢弃
+            # 而"静默丢失"计划挂单或错过风险审视窗口。
+            logger.error("决策失败（含重试），采用保守默认维持原状: %s", exc)
+            existing_watch = self.watch_store.all()
+            decision = TradingDecision(
+                market_assessment=(
+                    "决策解析失败，本轮保守维持原状（不产生任何新指令，保留现有挂单/持仓）。"
+                ),
+                instructions=[],
+                thesis_ops=[],
+                risk_notes=(
+                    "决策解析失败已按保守策略处理：不做任何操作，保留现有挂单与持仓，"
+                    "不修改操作理由，保存现有唤醒条件。请在下轮核验计划挂单是否存在。"
+                ),
+                watch_conditions=[
+                    WakeCondition(**{k: v for k, v in w.items()
+                                     if k in ("symbol", "condition", "value", "note",
+                                              "volume_mult", "duration_seconds")})
+                    for w in existing_watch
+                ],
+            )
+            logger.warning("决策失败已生成保守兜底（HOLD 维持原状），原因: %s", exc)
         result["market_assessment"] = decision.market_assessment
         result["risk_notes"] = decision.risk_notes
         result["thesis_ops"] = [op.model_dump() for op in decision.thesis_ops]
@@ -554,6 +615,7 @@ class TradingSystem:
                 decision.thesis_ops,
                 executed_open_symbols=executed_open_symbols,
                 account=account,
+                open_orders_by_symbol=open_orders_by_symbol,
             )
         except Exception as exc:  # noqa: BLE001
             logger.error("应用理由列表操作失败: %s", exc)
@@ -812,30 +874,55 @@ class TradingSystem:
         except Exception as exc:  # noqa: BLE001
             logger.error("应用经验库操作失败 %s: %s", action, exc)
 
-    def _apply_thesis_ops(self, ops, executed_open_symbols=None, account=None) -> None:
+    def _apply_thesis_ops(
+        self, ops, executed_open_symbols=None, account=None, open_orders_by_symbol=None
+    ) -> None:
         """应用模型对「操作理由列表」的操作（模型拥有完整操作权：ADD/UPDATE/DELETE）。
 
-        系统侧防护：模型 ADD 的「持仓理由」必须与该币种真实持仓、或本轮实际执行成功的
-        开仓对应；若指令被风控拦截/从未成交（既无真实持仓也无本轮开仓成功），则拒绝写入，
-        避免把并不存在的仓位记入理由列表，误导后续轮次（账户实际为空却误以为仍有仓位）。
+        系统侧防护（经验执行化：不依赖模型自觉读经验文本，执行层强制生效）：
+        - kind=position：理由必须与该币种真实持仓、或本轮实际执行成功的开仓对应；
+        - kind=limit_order：理由必须对应交易所中真实存活的 LIMIT 未成交挂单（含本轮
+          刚执行成功的开仓挂单）。若挂单被风控拦截、从未提交，理由列表不得记录
+          "幽灵挂单"，否则后续轮次会误以为该挂单仍存在（如"维持 ETH 限价挂单"）。
+
+        凡指令被风控拦截/从未成交（无真实挂单、无真实持仓、也无本轮开仓成功），
+        一律拒绝写入，避免把并不存在的操作记入理由列表误导后续轮次。
         """
         account_positions = {p.symbol for p in account.positions} if account else set()
         executed_open_symbols = executed_open_symbols or set()
+        # 交易所中当前存活未成交的 LIMIT 挂单所覆盖的币种集合（用于校验挂单理由是否真实）
+        open_orders_by_symbol = open_orders_by_symbol or {}
+        live_limit_symbols = {
+            o.get("symbol") for orders in open_orders_by_symbol.values()
+            for o in orders if o.get("type") == "LIMIT" and o.get("symbol")
+        }
         for op in ops:
             try:
                 if op.action == ThesisAction.ADD:
                     kind = op.kind or "position"
-                    if (
-                        kind == "position"
-                        and op.symbol not in account_positions
-                        and op.symbol not in executed_open_symbols
-                    ):
-                        logger.warning(
-                            "理由列表 ADD 拒绝：%s %s 未实际开仓（指令被拦截或未成交），"
-                            "不记录不存在的仓位",
-                            op.symbol, kind,
-                        )
-                        continue
+                    if kind == "position":
+                        if (
+                            op.symbol not in account_positions
+                            and op.symbol not in executed_open_symbols
+                        ):
+                            logger.warning(
+                                "理由列表 ADD 拒绝：%s position 未实际开仓（指令被拦截或"
+                                "未成交），不记录不存在的仓位",
+                                op.symbol,
+                            )
+                            continue
+                    elif kind == "limit_order":
+                        # 该币种需存在真实存活 LIMIT 挂单，或本轮刚执行成功的开仓挂单
+                        if (
+                            op.symbol not in live_limit_symbols
+                            and op.symbol not in executed_open_symbols
+                        ):
+                            logger.warning(
+                                "理由列表 ADD 拒绝：%s limit_order 在交易所无真实存活"
+                                " LIMIT 挂单（可能被风控拦截或从未提交），不记录幽灵挂单",
+                                op.symbol,
+                            )
+                            continue
                     self.theses.add(
                         symbol=op.symbol,
                         kind=op.kind or "position",

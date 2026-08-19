@@ -77,6 +77,9 @@ class Config:
         # 单品种止损绝对风险上限（占总权益比例）：(|开仓均价−止损价| × 持仓数量) ≤ 权益×此比例。
         # 此为代码级硬约束，配合风险额度锁（risk_locks）阻止止损漂移。
         self.max_sl_risk_ratio = _get_float("MAX_SL_RISK_RATIO", 0.02)
+        # 全局止损绝对风险总上限（占总权益比例）：所有币种已锁定风险之和 ≤ 权益×此比例。
+        # 用于开新单前合计当前全部持仓/挂单风险、检查剩余预算，防止多单挤占风险预算。
+        self.max_total_sl_risk_ratio = _get_float("MAX_TOTAL_SL_RISK_RATIO", 0.05)
         self.dry_run: bool = _get_bool("DRY_RUN", True)
 
         # ---- 运行参数 ----

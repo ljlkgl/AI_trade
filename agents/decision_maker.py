@@ -352,9 +352,36 @@ class DecisionMaker:
             temperature=config.llm_temperature,
             label=f"决策者 {self.llm.model}（输出交易举措）",
         )
+        # 校验并自动救回：格式类小误差（见 field_validator coerce）在校验器内兜底；
+        # 仍失败则带具体错误引导模型重试一次，避免整轮决策被丢弃、错过交易窗口。
         try:
-            decision = TradingDecision.model_validate(data)
+            return TradingDecision.model_validate(data)
         except Exception as exc:  # noqa: BLE001
-            logger.error("决策 JSON 校验失败: %s\n原始: %s", exc, json.dumps(data, ensure_ascii=False)[:800])
-            raise
-        return decision
+            logger.warning(
+                "决策 JSON 校验失败，带错误重试一次: %s\n原始: %s",
+                exc, json.dumps(data, ensure_ascii=False)[:800],
+            )
+        retry_messages = messages + [
+            {
+                "role": "assistant",
+                "content": json.dumps(data, ensure_ascii=False),
+            },
+            {
+                "role": "user",
+                "content": (
+                    "你的上一份 JSON 未通过系统校验，错误如下：\n"
+                    f"{exc}\n\n"
+                    "请严格修正以下类型与字段问题后重新输出完整 JSON：\n"
+                    "- order_id（若出现）必须是字符串 string（如 \"1107077654523\"），不要输出数字；\n"
+                    "- take_profits 必须恒为数组 list，不需要时输出 []（禁止 null）；\n"
+                    "- 严格遵守 DECISION_JSON_SCHEMA_HINT 里的字段类型与必填项。\n"
+                    "保持其余内容不变，只修正上述问题。"
+                ),
+            },
+        ]
+        data = self.llm.chat_json(
+            retry_messages,
+            temperature=config.llm_temperature,
+            label=f"决策者 {self.llm.model}（校验救回重试）",
+        )
+        return TradingDecision.model_validate(data)

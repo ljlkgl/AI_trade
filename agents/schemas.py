@@ -10,7 +10,7 @@ from __future__ import annotations
 from enum import Enum
 from typing import Optional
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 class OrderAction(str, Enum):
@@ -112,6 +112,14 @@ class TradeInstruction(BaseModel):
             "同时给 take_profit 与 take_profits 时，以 take_profits 为准"
         ),
     )
+
+    @field_validator("take_profits", mode="before")
+    @classmethod
+    def _coerce_take_profits(cls, v):
+        """容错：模型偶尔把 take_profits 输出为 null，按空表处理（非下单/忽略分批止盈）。"""
+        if v is None:
+            return []
+        return v
     reason: str = Field(
         description="该举措的详细理由，必须引用具体指标/价格/新闻事件时间/账户数据，说明依据与预期；不允许空泛理由",
     )
@@ -312,6 +320,14 @@ class ThesisOp(BaseModel):
         description="备注（如：已实现部分止盈、行情是否仍符合预期、剩余利润空间判断等）；ADD/UPDATE 均可",
     )
 
+    @field_validator("order_id", mode="before")
+    @classmethod
+    def _coerce_order_id(cls, v):
+        """容错：币安 orderId 为数字（int），模型常直接透传数字。统一转成字符串。"""
+        if v is None:
+            return None
+        return str(v)
+
     @model_validator(mode="after")
     def _validate(self):
         if self.action == ThesisAction.ADD:
@@ -375,6 +391,9 @@ class TradingDecision(BaseModel):
 # thesis_ops 为对「操作理由列表」的操作（可空）：ADD 新增（可带 parent_id 建立父子层级，
 # 如开仓=父、其止盈止损=各为子编号，层级可两层以上）/ UPDATE 修改 / COMPLETE 结束（标注完成记号，
 # 系统自动级联删除该编号及其全部子编号）/ DELETE 删除单个编号。
+# —— 输出类型硬性约定 ——
+# order_id 必须是字符串（string，如 "1234567890"），禁止输出为数字 int；
+# take_profits 必须恒为数组（list），不需要多档止盈时输出 []，绝对禁止输出 null。
 DECISION_JSON_SCHEMA_HINT = """{
   "market_assessment": "整体偏多/偏空/震荡的简短判断...",
   "instructions": [
@@ -471,7 +490,7 @@ DECISION_JSON_SCHEMA_HINT = """{
       "entry_price": 95000,
       "stop_loss": 94000,
       "take_profit": 100000,
-      "order_id": 1234567890,
+      "order_id": "1234567890",
       "thesis": "ETF 资金持续流入+MACD金叉，回调后重启上行，先平一半后剩单持有",
       "note": "已部分止盈 50%，剩余仓位继续持有，行情未偏离预期"
     },
