@@ -46,7 +46,7 @@ trade_tool/
 │   ├── schemas.py           # 结构化输出 Schema（交易举措 + 反思/经验库操作）
 │   ├── market_analyst.py    # 市场分析师（技术 + 新闻）
 │   ├── decision_maker.py    # 决策者（激进策略 + 假设检查 + 账户现状注入）
-│   └── reflector.py         # 反思者（自我反省 + 经验库维护）
+│   └── confirmer.py         # 确认者（执行前复核/修正 + 轮次反思与经验库维护）
 └── trading/
     ├── binance_client.py    # 币安 USDT-M 合约 API 客户端
     ├── indicators.py        # 技术指标计算（TradingAgents 指标体系）
@@ -250,7 +250,7 @@ python main.py --interval 60
 | TraderProposal（action/reasoning/entry/stop_loss/sizing） | `TradeInstruction`（动作/理由/价格/数量/杠杆/止损止盈，开仓强制止损） |
 | Portfolio Manager + 账户上下文 | `DecisionMaker`（注入账户现状 + 假设检查后结构化决策） |
 | TradingMemoryLog（决策复盘记忆） | `ThesisStore`（操作理由列表 + 父子层级编号 + COMPLETE 级联删除 + 自动清理） |
-| Reflector（回测结果反思） | `Reflector` + `ExperienceStore`（每轮自我反省 + 自主经验库） |
+| Reflector（回测结果反思） | `Confirmer.reflect`（反思职责已并入确认者）+ `ExperienceStore`（每轮复盘 + 自主经验库） |
 | 风控约束 | `RiskManager` 硬校验层 |
 
 ## 两档模型分工 + 三档推理强度（仿照 TradingAgents）
@@ -260,12 +260,12 @@ TradingAgents 用 `deep_think_llm` / `quick_think_llm` 两个模型按任务复�
 
 | 配置项 | 用途 | 默认 |
 |---|---|---|
-| `LLM_MODEL` | **quick_think_llm**：市场分析师、反思者（快速任务） | 必填 |
+| `LLM_MODEL` | **quick_think_llm**：市场分析师、确认者/反思（快速任务） | 必填 |
 | `LLM_DEEP_MODEL` | **deep_think_llm**：决策者/研究经理（复杂推理）；留空则回退 `LLM_MODEL` | 空 |
 | `LLM_REASONING_EFFORT` | 推理强度三档 `low` / `medium` / `high`，随请求发送；留空则不发送 | `medium` |
 
 分工与 TradingAgents 对齐：`DecisionMaker`（对应 Research Manager / Portfolio Manager）
-使用深度模型；`MarketAnalyst` 与 `Reflector` 使用快速模型。
+使用深度模型；`MarketAnalyst` 与 `Confirmer`（确认 + 反思）使用快速模型。
 
 注意：部分 OpenAI 兼容接口（如某些 SenseNova/DeepSeek 网关）不接受
 `reasoning_effort` 参数，系统检测到接口报错后会自动移除该参数降级重试，不会中断运行。

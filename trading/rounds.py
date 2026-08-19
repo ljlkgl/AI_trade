@@ -71,7 +71,7 @@ class RoundLog:
             "market_assessment", "risk_notes",
             "thesis_ops", "watch_conditions", "risk_blocked",
             "instructions_after_risk", "confirmations", "execution",
-            "thesis_count", "reflection", "error",
+            "thesis_count", "reflection", "error", "analyst_state",
         )
         return {k: result.get(k) for k in keep_keys if k in result}
 

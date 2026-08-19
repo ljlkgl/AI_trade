@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import logging
 import uuid
+from decimal import Decimal, ROUND_HALF_UP
 from typing import Any, Optional
 
 from agents.schemas import OrderAction, OrderType, TradeInstruction
@@ -19,18 +20,24 @@ logger = logging.getLogger(__name__)
 
 
 def round_to_step(value: float, step: float) -> float:
-    """按 stepSize 向下取整，避免精度错误。"""
+    """按 stepSize 量化并去掉浮点噪声，避免精度错误。
+
+    例：round_to_step(0.007776, 0.0001) -> 0.0078（而非 0.0078000000000000005）。
+    用 Decimal 计算后再转 float，保证 str() 序列化时是干净的十进制表示。
+    """
     if step <= 0:
         return value
-    n = int(round(value / step))
-    return n * step
+    dstep = Decimal(str(step))
+    n = (Decimal(str(value)) / dstep).to_integral_value(rounding=ROUND_HALF_UP)
+    return float((n * dstep).quantize(dstep))
 
 
 def round_price(value: float, tick: float) -> float:
     if tick <= 0:
         return value
-    n = int(round(value / tick))
-    return n * tick
+    dstep = Decimal(str(tick))
+    n = (Decimal(str(value)) / dstep).to_integral_value(rounding=ROUND_HALF_UP)
+    return float((n * dstep).quantize(dstep))
 
 
 class OrderExecutor:
@@ -413,12 +420,16 @@ class OrderExecutor:
     ) -> list[dict]:
         """为仓位挂 STOP_MARKET / TAKE_PROFIT_MARKET 保护单（Algo Order API）。
 
+        支持分批止盈：单个 take_profit 平全仓；take_profits 多档则每档按比例 qty×fraction 独立挂单。
+        每档独立下单，个别失败（如交易所限「每仓位 1 TP + 1 SL」时第二档被拒）不阻断其余，
+        失败信息记入 placed 对应项的 "fail" 字段，由调用方日志披露。
+
         protective_side：保护单方向（多头仓位→SELL 保护；空头仓位→BUY 保护）。
         protective_position_side：双向模式下保护单所属仓位方向 LONG/SHORT（单向为 None）。
         双向模式(Hedge Mode)禁传 reduceOnly（由 positionSide 指定仓位方向）；
         单向模式传 positionSide=BOTH + reduceOnly=True。
         """
-        placed = []
+        placed: list[dict] = []
         symbol_info = self.client.get_symbol_info(ins.symbol)
         if self.hedge_mode:
             algo_position_side = protective_position_side or "BOTH"
@@ -426,34 +437,42 @@ class OrderExecutor:
         else:
             algo_position_side = "BOTH"
             reduce_only = True
+
+        def _place(kind: str, otype: str, trigger: float, oqty: float, tag: str) -> None:
+            try:
+                order = self.client.place_algo_order(
+                    symbol=ins.symbol,
+                    side=protective_side,
+                    order_type=otype,
+                    quantity=oqty,
+                    trigger_price=trigger,
+                    position_side=algo_position_side,
+                    client_algo_id=self._client_order_id(tag),
+                    reduce_only=reduce_only,
+                )
+                placed.append({"kind": kind, "order": order,
+                               "order_id": order.get("algoId")})
+            except Exception as exc:  # noqa: BLE001
+                placed.append({"kind": kind, "fail": str(exc)})
+
         if ins.stop_loss is not None:
-            sl = self._price(symbol_info, ins.stop_loss)
-            order = self.client.place_algo_order(
-                symbol=ins.symbol,
-                side=protective_side,
-                order_type="STOP_MARKET",
-                quantity=qty,
-                trigger_price=sl,
-                position_side=algo_position_side,
-                client_algo_id=self._client_order_id("sl"),
-                reduce_only=reduce_only,
-            )
-            placed.append({"kind": "stop_loss", "order": order,
-                           "order_id": order.get("algoId")})
-        if ins.take_profit is not None:
-            tp = self._price(symbol_info, ins.take_profit)
-            order = self.client.place_algo_order(
-                symbol=ins.symbol,
-                side=protective_side,
-                order_type="TAKE_PROFIT_MARKET",
-                quantity=qty,
-                trigger_price=tp,
-                position_side=algo_position_side,
-                client_algo_id=self._client_order_id("tp"),
-                reduce_only=reduce_only,
-            )
-            placed.append({"kind": "take_profit", "order": order,
-                           "order_id": order.get("algoId")})
+            _place("stop_loss", "STOP_MARKET",
+                   self._price(symbol_info, ins.stop_loss), qty, "sl")
+
+        tps = ins.take_profits or []
+        if tps:
+            for i, lv in enumerate(tps, 1):
+                oqty = self._quantity(symbol_info, qty * lv.fraction)
+                if oqty <= 0:
+                    placed.append({"kind": f"take_profit_{i}",
+                                   "fail": "按比例折算后数量为0，忽略"})
+                    continue
+                _place(f"take_profit_{i}", "TAKE_PROFIT_MARKET",
+                       self._price(symbol_info, lv.price), oqty, f"tp{i}")
+        elif ins.take_profit is not None:
+            _place("take_profit", "TAKE_PROFIT_MARKET",
+                   self._price(symbol_info, ins.take_profit), qty, "tp")
+
         return placed
 
     def _close(

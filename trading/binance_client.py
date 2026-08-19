@@ -261,7 +261,10 @@ class BinanceClient:
             params["price"] = price
         if stop_price is not None:
             params["stopPrice"] = stop_price
-        if time_in_force:
+        # 只对限价单(LIMIT)发送 timeInForce；市价单(MARKET)一律不携带该参数，
+        # 否则币安返回 400 "Parameter 'timeInForce' sent when not required"，
+        # 曾导致市价减仓(close_position)全部被拒。
+        if time_in_force and order_type == "LIMIT":
             params["timeInForce"] = time_in_force
         if client_order_id:
             params["newClientOrderId"] = client_order_id

@@ -14,7 +14,7 @@
 5. 决策者（接收市场报告 + 新闻 + 理由列表 + 最少保证金 + 经验库 + 账户现状）→ 结构化举措
 6. 风控校验 → 逐条确认 → 执行
 7. 应用模型对理由列表的操作（thesis_ops：ADD/UPDATE/DELETE）+ 自动同步补录/清理
-8. 反思者复盘本轮结果，自主写入/修改/删除经验库条目，供以后参考
+8. 确认者复盘本轮结果（反思者职责已并入确认者），直接用行动写入/修改/删除经验库条目
 """
 from __future__ import annotations
 
@@ -29,9 +29,9 @@ from agents.confirmer import Confirmer
 from agents.decision_maker import DecisionMaker, format_account_context
 from agents.llm import AllLLMUnavailable, LLMClient
 from agents.market_analyst import MarketAnalyst
-from agents.reflector import Reflector
-from agents.schemas import ConfirmationAction, ExperienceAction, ThesisAction
+from agents.schemas import ConfirmationAction, ExperienceAction, OrderAction, ThesisAction
 from config import config
+from trading.analyst_state import AnalystStateStore
 from trading.binance_client import BinanceClient
 from trading.experience import ExperienceStore
 from trading.executor import OrderExecutor
@@ -88,6 +88,24 @@ def _merge_open_orders(symbol: str, client: BinanceClient) -> list[dict]:
     return orders
 
 
+def _live_open_order_ids(open_orders_by_symbol: dict[str, list]) -> set[str]:
+    """收集当前仍存活的未成交钉单 id（orderId / algoId），统一为 str 集合。
+
+    用于操作理由（thesis）的「绑定钉单号存活」校验：若某条理由绑定的单号
+    已不在存活钉单中且无对应持仓，则系统自动清除该理由（防模型遗忘清理）。
+    """
+    live: set[str] = set()
+    for orders in open_orders_by_symbol.values():
+        for o in orders:
+            oid = o.get("orderId")
+            if oid is not None:
+                live.add(str(oid))
+            cid = o.get("clientOrderId")
+            if cid:
+                live.add(str(cid))
+    return live
+
+
 class TradingSystem:
     """整合行情→分析→决策→风控→执行→假设记录的主流程。"""
 
@@ -120,8 +138,8 @@ class TradingSystem:
         self.news_service = NewsService()
         self.market_analyst = MarketAnalyst(self.llm)
         self.decision_maker = DecisionMaker(self.llm_deep)
-        self.reflector = Reflector(self.llm)
-        # 执行前逐条确认者（用 quick 模型：单条指令的轻量复核）
+        # 执行前逐条确认者（用 quick 模型：单条指令的轻量复核）；
+        # 反思者职责已并入确认者（每轮后由确认者复盘并直接维护经验库）
         self.confirmer = Confirmer(self.llm)
         self.risk = RiskManager()
         # 启动时检查持仓模式：单向(One-way)则切换为双向(Hedge Mode)
@@ -141,6 +159,8 @@ class TradingSystem:
         self.watch_store = WatchStore(max_age_hours=config.watch_max_age_hours)
         self.round_log = RoundLog()
         self.runtime = RuntimeState()
+        # 分析师跨轮状态：持久化上一轮观点，供下一轮对照标注 bias_change / 记翻转日志
+        self.analyst_state = AnalystStateStore()
         self.symbols = config.symbols
         self._last_reflection: Optional[dict] = None
         self._web_controller: Optional[WebServerController] = None
@@ -275,7 +295,11 @@ class TradingSystem:
         account_positions = {p.symbol: p for p in account.positions}
         if not config.dry_run:
             try:
-                pruned = self.theses.prune_stale(account_positions, open_orders_by_symbol)
+                pruned = self.theses.prune_stale(
+                    account_positions,
+                    open_orders_by_symbol,
+                    live_open_order_ids=_live_open_order_ids(open_orders_by_symbol),
+                )
                 if pruned:
                     logger.info("操作理由列表已自动清理 %d 条过期条目", pruned)
             except Exception as exc:  # noqa: BLE001
@@ -301,9 +325,15 @@ class TradingSystem:
             news_context = "（新闻获取失败，本轮忽略新闻面）"
         result["news_context_len"] = len(news_context)
 
-        # 5. 市场分析师产出报告（技术 + 新闻）
+        # 5. 市场分析师产出结构化报告（多周期指标+K线 + 新闻 + 跨轮状态 + 现价）
         try:
-            market_report = self.market_analyst.analyze(market_context, news_context)
+            analyst_out = self.market_analyst.analyze(
+                market_context,  # 多周期指标快照（布林/均线/K线，主输入）
+                news_context,
+                prior_context=self.analyst_state.format_prior_context(),
+                current_prices=price_map,
+            )
+            market_report = self._analyst_to_text(analyst_out)
             logger.info("市场分析报告已生成（%d 字符）", len(market_report))
         except AllLLMUnavailable as exc:
             return self._handle_llm_outage(exc, result)
@@ -312,12 +342,30 @@ class TradingSystem:
             result["error"] = f"市场分析失败: {exc}"
             return result
         result["market_report"] = market_report
+        result["analyst_state"] = self._analyst_state_bytes(analyst_out)
+
+        # 5.5 分析师翻转检测 + 持久化状态（供下一轮对照）
+        #     在方向翻转时醒目记录日志，暴露入场级判断的漂移，避免"报告永远积极"
+        try:
+            previous_assets = self.analyst_state.prior_assets_by_symbol()
+            # 先写回本轮（detect_flips 读当前 last），再做差异说明
+            self.analyst_state.save_views(
+                analyst_out.market_overview,
+                [a.model_dump() for a in analyst_out.assets],
+                [n.model_dump() for n in analyst_out.news_pricing],
+            )
+            self._log_analyst_changes(previous_assets, analyst_out.assets)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("分析师状态持久化失败（不影响本轮）: %s", exc)
 
         # 6. 决策者输出结构化举措（含账户现状 + 操作理由列表 + 最少保证金 + 经验库）
+        #     新闻定价时效（分析师给出 priced_in_by_utc / window_hours）拼进 news_context，
+        #     让规则16真正判断"未定价剩余空间"窗口是否仍有效，减少滞后错过/误追。
         try:
             experience_context = self.experiences.format_for_context()
+            news_ctx_for_decider = self._append_news_timing(news_context, analyst_out)
             decision = self.decision_maker.decide(
-                market_report, news_context, thesis_context, account,
+                market_report, news_ctx_for_decider, thesis_context, account,
                 experience_context=experience_context,
                 open_orders_by_symbol=open_orders_by_symbol,
                 min_margin_context=min_margin_context,
@@ -350,6 +398,20 @@ class TradingSystem:
         # 8. 风控校验（价格/精度已在第 2 步获取，此处复用）
         passed, risk_results = self.risk.validate_decision(
             decision.instructions, account, price_map, symbol_info_map
+        )
+        # 指令执行顺序（确定性拆分）：同一币种先平仓/减仓(CLOSE/FLATTEN)，再调整
+        # 止盈止损(SET_SL_TP)——SET_SL_TP 无数量参数、作用于当前全部持仓，只有先
+        # 减仓它才会自动保护剩余仓位；避免「依赖减仓却先执行 SET_SL_TP」导致风控落空。
+        # 其余指令（开仓/挂单管理）保持模型原相对顺序，不受影响。
+        _RISK_ORDER = {
+            OrderAction.CLOSE_LONG: 0,
+            OrderAction.CLOSE_SHORT: 0,
+            OrderAction.FLATTEN: 0,
+            OrderAction.SET_SL_TP: 1,
+        }
+        passed = sorted(
+            passed,
+            key=lambda i: (_RISK_ORDER.get(i.action, 2),),
         )
         result["risk_blocked"] = [
             {"symbol": r.errors[0].split(":")[0], "errors": r.errors}
@@ -497,7 +559,7 @@ class TradingSystem:
             logger.error("同步操作理由列表失败: %s", exc)
         result["thesis_count"] = self.theses.count()
 
-        # 11. 反思者复盘本轮，自主维护经验库（写入/修改/删除）
+        # 11. 确认者复盘本轮（反思者职责已并入确认者），直接维护经验库（写入/修改/删除）
         self._reflect_and_apply(
             decision, exec_results, account, thesis_context, market_report,
             open_orders_by_symbol=open_orders_by_symbol,
@@ -570,6 +632,101 @@ class TradingSystem:
             + "\n".join(lines)
         )
 
+    @staticmethod
+    def _analyst_to_text(analyst_out) -> str:
+        """把分析师结构化输出拼成决策者/反思者可读的 markdown 报告。"""
+        blocks = ["# 市场分析报告", "## 市场总览", analyst_out.market_overview, ""]
+        for a in analyst_out.assets:
+            blocks.append(f"## {a.symbol} — {a.bias.value}（信心 {a.confidence}）")
+            blocks.append(f"- 相对上轮: {a.bias_change.value}")
+            blocks.append(f"- 依据: {a.reason}")
+            blocks.append(
+                f"- 支撑区: {a.support_low:g}–{a.support_high:g} | "
+                f"压力区: {a.resistance_low:g}–{a.resistance_high:g}"
+            )
+            entry_str = (
+                f"{a.entry_from:g}–{a.entry_to:g}" if a.entry_from is not None else "无清晰信号"
+            )
+            t2 = f"{a.target_2:g}" if a.target_2 is not None else "无"
+            blocks.append(
+                f"- 建议入场: {entry_str} | "
+                f"T1目标: {a.target_1:g} | T2目标: {t2} | 止损: {a.stop_price:g}"
+            )
+            blocks.append(f"- 分化可能: {a.divergence}")
+            blocks.append("")
+        if analyst_out.news_pricing:
+            blocks.append("## 新闻定价与时效")
+            for n in analyst_out.news_pricing:
+                blocks.append(
+                    f"- [{n.impact_direction}] {n.headline} → {n.priced_in}"
+                    f"（预计完全消化@{n.priced_in_by_utc}，窗口 {n.window_hours:g}h）"
+                    f" {n.remaining_space}"
+                )
+            blocks.append("")
+        return "\n".join(blocks).strip()
+
+    @staticmethod
+    def _analyst_state_bytes(analyst_out) -> dict:
+        """精简的分析师状态摘要（供 result/展示，不含过重文本）。"""
+        return {
+            "market_overview": analyst_out.market_overview,
+            "assets": [
+                {
+                    "symbol": a.symbol, "bias": a.bias.value,
+                    "bias_change": a.bias_change.value, "confidence": a.confidence,
+                    "support_low": a.support_low, "support_high": a.support_high,
+                    "resistance_low": a.resistance_low, "resistance_high": a.resistance_high,
+                }
+                for a in analyst_out.assets
+            ],
+        }
+
+    def _log_analyst_changes(self, previous_assets: dict[str, dict], curr_assets) -> None:
+        """对比上轮与本轮观点，记日志：翻转时醒目告警，暴露入场级判断漂移。"""
+        for cur in curr_assets:
+            sym = cur.symbol
+            prev = previous_assets.get(sym)
+            bc = cur.bias_change.value
+            if prev is None:
+                logger.info("分析师 %s: 首次给出观点 bias=%s（NEW）", sym, cur.bias.value)
+                continue
+            prev_bias = prev.get("bias")
+            cur_bias = cur.bias.value
+            if prev_bias != cur_bias and prev_bias in ("LONG", "SHORT") and cur_bias in ("LONG", "SHORT"):
+                logger.warning(
+                    "分析师观点翻转 %s: %s -> %s（%s）。上一轮支撑/压力=[%s,%s]/[%s,%s]，"
+                    "本轮=[%s,%s]/[%s,%s]。依据: %s",
+                    sym, prev_bias, cur_bias, bc,
+                    prev.get("support_low"), prev.get("support_high"),
+                    prev.get("resistance_low"), prev.get("resistance_high"),
+                    cur.support_low, cur.support_high,
+                    cur.resistance_low, cur.resistance_high,
+                    cur.reason[:160],
+                )
+            elif prev_bias != cur_bias:
+                logger.info(
+                    "分析师观点调整 %s: %s -> %s（%s）", sym, prev_bias, cur_bias, bc,
+                )
+
+    @staticmethod
+    def _append_news_timing(news_context: str, analyst_out) -> str:
+        """把新闻定价时效（up to priced_in_by_utc）追加到新闻上下文，供决策者判断窗口。"""
+        if not analyst_out.news_pricing:
+            return news_context
+        block = ["", "", "# 新闻定价时效（分析师估算的剩余可交易窗口）",
+                 "用以下时间点判断“未定价剩余空间”是否仍可行动：", ""]
+        for n in analyst_out.news_pricing:
+            block.append(
+                f"- [{n.impact_direction}] {n.headline}：{n.priced_in}"
+                f"；剩余空间={n.remaining_space}；预计完全消化@{n.priced_in_by_utc}"
+                f"（距现约 {n.window_hours:g}h）。"
+            )
+        block.append(
+            "\n若 priced_in_by_utc 已过 / window_hours≈0，视为已消化、不再追；"
+            "若仍有剩余窗口，可在尊重技术面与不追高前提下，于支撑/压力位择机利用。"
+        )
+        return news_context + "\n".join(block)
+
     def _reflect_and_apply(
         self,
         decision,
@@ -580,8 +737,8 @@ class TradingSystem:
         open_orders_by_symbol: dict | None = None,
         risk_blocked: list[dict] | None = None,
     ) -> None:
-        """运行反思者并应用经验库操作。"""
-        # 反思执行结果，失败/降级不阻断主流程
+        """由确认者复盘本轮（原反思者职责），并应用经验库操作。"""
+        # 复盘执行结果，失败/降级不阻断主流程
         try:
             account_positions = {p.symbol: p for p in account.positions}
             prev_ctx = self.theses.render_drift_check(account_positions)
@@ -595,7 +752,7 @@ class TradingSystem:
                     for i in decision.instructions
                 ],
             }, ensure_ascii=False, indent=2)
-            reflection = self.reflector.reflect(
+            reflection = self.confirmer.reflect(
                 market_report=market_report,
                 decision_summary=decision_summary,
                 execution_results=exec_results,
@@ -608,7 +765,7 @@ class TradingSystem:
                 "self_assessment": reflection.self_assessment,
                 "severe_loss": reflection.severe_loss,
             }
-            logger.info("反思评估: %s", reflection.self_assessment[:120])
+            logger.info("确认者-反思评估: %s", reflection.self_assessment[:120])
             for op in reflection.experience_ops:
                 self._apply_experience_op(op)
         except AllLLMUnavailable as exc:
@@ -683,6 +840,7 @@ class TradingSystem:
                         entry_price=op.entry_price,
                         stop_loss=op.stop_loss,
                         take_profit=op.take_profit,
+                        order_id=op.order_id,
                         thesis=op.thesis,
                         note=op.note,
                     )
@@ -691,7 +849,8 @@ class TradingSystem:
                         k: v for k, v in {
                             "kind": op.kind, "direction": op.direction,
                             "entry_price": op.entry_price, "stop_loss": op.stop_loss,
-                            "take_profit": op.take_profit, "thesis": op.thesis,
+                            "take_profit": op.take_profit, "order_id": op.order_id,
+                            "thesis": op.thesis,
                             "note": op.note, "parent_id": op.parent_id,
                         }.items() if v is not None
                     }
@@ -749,9 +908,11 @@ class TradingSystem:
                 entry_price=entry,
                 stop_loss=ins.stop_loss,
                 take_profit=ins.take_profit,
+                order_id=r.get("order_id"),
                 thesis=ins.reason,
             )
-            logger.info("已为 %s %s 自动补录操作理由", symbol, "挂单" if is_limit else "开仓")
+            logger.info("已为 %s %s 自动补录操作理由(绑定单号=%s)",
+                        symbol, "挂单" if is_limit else "开仓", r.get("order_id"))
 
         # 2. 真实模式：挂单成交→升级为持仓理由；并按真实账户清理过期条目
         #    注意：此处必须重新获取最新账户（而非执行前快照），否则刚开仓的仓位
@@ -776,7 +937,11 @@ class TradingSystem:
                 }
             except Exception:  # noqa: BLE001
                 open_orders_by_symbol = {}
-            removed = self.theses.prune_stale(account_positions, open_orders_by_symbol)
+            removed = self.theses.prune_stale(
+                account_positions,
+                open_orders_by_symbol,
+                live_open_order_ids=_live_open_order_ids(open_orders_by_symbol),
+            )
             if removed:
                 logger.info("操作理由列表自动清理 %d 条过期条目", removed)
 
@@ -852,7 +1017,14 @@ class TradingSystem:
                 return True
 
     def _check_watch_triggers(self) -> bool:
-        """轮询当前价并核对唤醒条件；任一满足则清除条件并返回 True。"""
+        """轮询当前价并核对唤醒条件；任一满足（含量能/时间确认）则清除条件并返回 True。
+
+        抗噪声确认（可选，字段见 WakeCondition）：
+        - volume_mult>0：触发时当前 1m K 线成交量 ≥ volume_mult × 前 20 根平均成交量，
+          量化「放量突破」，防止无量漂过阈值也唤醒。
+        - duration_seconds>0：价格需持续停留在阈值外达该时长才唤醒（首次命中记时间戳，
+          之后每次轮询累加），过滤单根 K 线的瞬时刺穿。
+        """
         triggered: list[tuple[dict, float]] = []
         for t in self.watch_store.all():
             try:
@@ -861,10 +1033,47 @@ class TradingSystem:
                 logger.warning("检查 %s 唤醒条件失败: %s", t["symbol"], exc)
                 continue
             cond, val = t.get("condition"), t.get("value")
-            if cond == "price_above" and price >= val:
-                triggered.append((t, price))
-            elif cond == "price_below" and price <= val:
-                triggered.append((t, price))
+            hit = (cond == "price_above" and price >= val) or (
+                cond == "price_below" and price <= val
+            )
+            if not hit:
+                # 价格已回到阈值内：重置时间确认计时
+                if "first_hit_at" in t:
+                    del t["first_hit_at"]
+                    self.watch_store.save()
+                continue
+            # 量能确认：当前 1m K 线成交量 ≥ volume_mult × 前 20 根平均成交量
+            vol_mult = float(t.get("volume_mult") or 0)
+            if vol_mult > 0:
+                try:
+                    candles = self.client.get_klines(
+                        t["symbol"], interval="1m", limit=20
+                    )
+                    if len(candles) >= 2:
+                        cur_vol = candles[-1].volume
+                        avg_vol = sum(c.volume for c in candles[:-1]) / max(
+                            len(candles) - 1, 1
+                        )
+                        if cur_vol < vol_mult * avg_vol:
+                            logger.info(
+                                "%s 唤醒条件量能不足（%.4g < %.4g×%.4g），视为噪声不触发",
+                                t["symbol"], cur_vol, vol_mult, avg_vol,
+                            )
+                            continue
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("检查 %s 唤醒条件量能失败: %s", t["symbol"], exc)
+            # 时间确认：价格需持续停留在阈值外 duration_seconds 秒
+            dur = int(t.get("duration_seconds") or 0)
+            if dur > 0:
+                now = time.time()
+                first = t.get("first_hit_at")
+                if first is None:
+                    t["first_hit_at"] = now
+                    self.watch_store.save()
+                    continue  # 首次命中，等待后续轮询累计持续时间
+                if now - float(first) < dur:
+                    continue  # 尚未达到要求持续时间，暂不触发
+            triggered.append((t, price))
         if triggered:
             detail = "; ".join(
                 f"{t['symbol']} {t['condition']}@{t['value']:g}（现价 {price:.6g}）"

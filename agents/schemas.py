@@ -34,6 +34,25 @@ class OrderType(str, Enum):
     LIMIT = "LIMIT"     # 限价单（挂单）
 
 
+class TakeProfitLevel(BaseModel):
+    """单档止盈：到价后按持仓比例（fraction）市价平仓。供分批止盈（多档）使用。"""
+
+    price: float = Field(description="本档止盈触发价。多仓须 > 现价，空仓须 < 现价")
+    fraction: float = Field(
+        description="本档平仓占持仓的比例 (0,1]；多档之和须 ≤ 1（如 T1 平 0.5、T2 平 0.3）"
+    )
+
+    @model_validator(mode="after")
+    def _validate(self):
+        if self.price <= 0:
+            raise ValueError(f"止盈价必须为正数，收到: {self.price}")
+        if not (0 < self.fraction <= 1):
+            raise ValueError(
+                f"止盈比例必须 ∈ (0,1]，收到: {self.fraction}"
+            )
+        return self
+
+
 class TradeInstruction(BaseModel):
     """单条交易举措。"""
 
@@ -68,7 +87,15 @@ class TradeInstruction(BaseModel):
         default=None, description="止损价（触发后按市价平仓，方向随仓位方向）"
     )
     take_profit: Optional[float] = Field(
-        default=None, description="止盈价（触发后按市价平仓）"
+        default=None, description="止盈价（触发后按市价平仓，单档止盈用；多档请用 take_profits）"
+    )
+    take_profits: list[TakeProfitLevel] = Field(
+        default_factory=list,
+        description=(
+            "多档止盈（分批止盈）：到价后按各档比例市价平仓，如 [T1 平50%, T2 再平30%]。"
+            "各档 fraction 之和须 ≤ 1，剩余仓位走移动止损；多仓 price 递增、空仓递减。"
+            "同时给 take_profit 与 take_profits 时，以 take_profits 为准"
+        ),
     )
     reason: str = Field(
         description="该举措的详细理由，必须引用具体指标/价格/新闻事件时间/账户数据，说明依据与预期；不允许空泛理由",
@@ -129,11 +156,26 @@ class TradeInstruction(BaseModel):
                 f"必须≥10 字符：详细说明依据（具体指标/价格/新闻事件时间/账户数据）与预期，"
                 f"不允许「看多」「止损了」这类空泛表述"
             )
+        # 分批止盈比例之和不得超过 1（剩余仓位走移动止损）
+        if self.take_profits:
+            total = sum(lv.fraction for lv in self.take_profits)
+            if total > 1.0 + 1e-9:
+                raise ValueError(
+                    f"{self.symbol} {self.action.value} 的分批止盈比例之和 {total:.2f} 超过 1，"
+                    f"必须 ≤ 1（剩余仓位由移动止损覆盖）"
+                )
         return self
 
 
 class WakeCondition(BaseModel):
-    """条件唤醒（watch trigger）：价格触及阈值时唤醒系统提前分析。"""
+    """条件唤醒（watch trigger）：价格触及阈值时唤醒系统提前分析。
+
+    抗噪声确认（均为可选，默认 0=不启用）：
+    - volume_mult：触发时当前 K 线成交量 ≥ volume_mult × 近期平均成交量才算有效
+      （如放量突破 1.5 倍）；避免无量阴跌/阴涨漂过阈值也唤醒。
+    - duration_seconds：价格需持续停留在阈值外 duration_seconds 秒才唤醒；
+      过滤单根 1m K 线的瞬时刺穿。
+    """
 
     symbol: str = Field(description="永续合约交易对，如 BTCUSDT")
     condition: str = Field(
@@ -142,6 +184,14 @@ class WakeCondition(BaseModel):
     value: float = Field(description="目标价格阈值")
     note: str = Field(
         default="", description="触发原因说明（为什么关注这个价位，供触发后的分析参考）"
+    )
+    volume_mult: float = Field(
+        default=0.0,
+        description="放量确认倍数：触发时当前成交量 ≥ volume_mult × 平均成交量（0=不要求放量）",
+    )
+    duration_seconds: int = Field(
+        default=0,
+        description="时间确认：价格需持续越过阈值 duration_seconds 秒（0=不要求持续时间）",
     )
 
     @model_validator(mode="after")
@@ -152,6 +202,10 @@ class WakeCondition(BaseModel):
             )
         if self.value <= 0:
             raise ValueError(f"value 必须为正数，收到: {self.value}")
+        if self.volume_mult < 0:
+            raise ValueError(f"volume_mult 必须 ≥ 0，收到: {self.volume_mult}")
+        if self.duration_seconds < 0:
+            raise ValueError(f"duration_seconds 必须 ≥ 0，收到: {self.duration_seconds}")
         return self
 
 
@@ -215,6 +269,15 @@ class ThesisOp(BaseModel):
     )
     stop_loss: Optional[float] = Field(default=None, description="止损价；ADD 时可选")
     take_profit: Optional[float] = Field(default=None, description="止盈价；ADD 时可选")
+    order_id: Optional[str] = Field(
+        default=None,
+        description=(
+            "绑定的币安官方订单 id（orderId / algoId / clientOrderId）。"
+            "代表该操作对应的真实币安挂单或开仓单号；当你 ADD 某操作可引用已有挂单单号，"
+            "系统也会在开仓/挂单成功后自动补录真实单号。系统会据此判断该操作是否仍有效："
+            "若此单号既不在当前未成交挂单列表、也不在持仓列表，则该理由会被自动清除"
+        ),
+    )
     thesis: Optional[str] = Field(
         default=None,
         description="完整的操作理由 / 假设（为什么做这个操作、依据、预期）；ADD 时必填，UPDATE 时可更新",
@@ -296,8 +359,12 @@ DECISION_JSON_SCHEMA_HINT = """{
       "margin": 60,
       "leverage": 15,
       "stop_loss": 94000,
-      "take_profit": 100000,
-      "reason": "MACD金叉且价格站上50SMA，趋势偏多；margin=60U ≈ 名义价值 900U，约可用余额的15%"
+      "take_profit": null,
+      "take_profits": [
+        {"price": 100000, "fraction": 0.5},
+        {"price": 102000, "fraction": 0.3}
+      ],
+      "reason": "MACD金叉且价格站上50SMA，趋势偏多；margin=60U ≈ 名义价值 900U，约可用余额的15%。止盈分批：T1 平50%、T2 再平30%，剩余20%移动止损"
     },
     {
       "symbol": "BTCUSDT",
@@ -363,6 +430,7 @@ DECISION_JSON_SCHEMA_HINT = """{
       "entry_price": 95000,
       "stop_loss": 94000,
       "take_profit": 100000,
+      "order_id": 1234567890,
       "thesis": "ETF 资金持续流入+MACD金叉，回调后重启上行，先平一半后剩单持有",
       "note": "已部分止盈 50%，剩余仓位继续持有，行情未偏离预期"
     },
@@ -411,13 +479,17 @@ DECISION_JSON_SCHEMA_HINT = """{
       "symbol": "BTCUSDT",
       "condition": "price_above",
       "value": 102000,
-      "note": "突破前高后准备追多，唤醒我复核"
+      "note": "放量突破前高后准备追多，唤醒我复核",
+      "volume_mult": 1.5,
+      "duration_seconds": 300
     },
     {
       "symbol": "BTCUSDT",
       "condition": "price_below",
       "value": 93000,
-      "note": "跌破关键支撑则风控收紧，唤醒我处理"
+      "note": "跌破关键支撑则风控收紧，唤醒我处理",
+      "volume_mult": 0,
+      "duration_seconds": 0
     }
   ],
   "risk_notes": "风险提示...（不涉及具体账户数字，只做风控说明）"
@@ -520,5 +592,145 @@ class Reflection(BaseModel):
         description=(
             "对经验库的操作列表。严重亏损或发现不足时应 WRITE 写入经验；"
             "发现已有经验过时/错误可 UPDATE 或 DELETE。无操作时为空列表"
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
+# 市场分析师（含新闻定价时效）—— 使分析师「有状态」，跨轮一致
+# ---------------------------------------------------------------------------
+
+
+class AnalystBias(str, Enum):
+    """分析师对单标的的方向判断。"""
+
+    LONG = "LONG"          # 看多
+    SHORT = "SHORT"        # 看空
+    NEUTRAL = "NEUTRAL"    # 中性 / 观望
+
+
+class BiasChange(str, Enum):
+    """相对上一轮观点是否变化（供系统对比与日志记录）。"""
+
+    UNCHANGED = "UNCHANGED"          # 观点与上一轮一致
+    FLIPPED = "FLIPPED"              # 方向翻转（多<->空）
+    FROM_NEUTRAL = "FROM_NEUTRAL"    # 上一轮中性 -> 本轮有方向
+    TO_NEUTRAL = "TO_NEUTRAL"        # 上一轮有方向 -> 本轮中性
+    NEW = "NEW"                      # 首次出现（上一轮无此标的判断）
+    REINFORCED = "REINFORCED"        # 方向不变但信心明显增强/转弱（可在 confidence 体现）
+
+
+class AnalystAssetView(BaseModel):
+    """分析师对单个资产的结构化观点（支撑/压力用具体区间）。"""
+
+    symbol: str = Field(description="永续合约交易对，如 BTCUSDT")
+    bias: AnalystBias = Field(description="方向判断")
+    confidence: str = Field(
+        description="信心：high / medium / low，并简述依据"
+    )
+    bias_change: BiasChange = Field(
+        description=(
+            "相对上一轮观点的变化（系统提供上一轮摘要，务必如实标注）；"
+            "若发生相反方向的变化，请在 reason 中说明驱动因素，避免无依据翻转"
+        )
+    )
+    reason: str = Field(
+        description=(
+            "方向结论的核心依据：引用具体指标值（价格、SMA/MACD/RSI/MFI、布林位置）、"
+            "关键位与新闻事件时间方向"
+        )
+    )
+    support_low: float = Field(
+        description=(
+            "下方支撑区下限（具体价位）。主参照=布林带/均线(constrained)等技术指标区间；"
+            "次参照=K线前高/前低等结构确认指标位的辅助信息"
+        )
+    )
+    support_high: float = Field(description="下方支撑区上限（具体价位）")
+    resistance_low: float = Field(description="上方压力区下限（具体价位）")
+    resistance_high: float = Field(description="上方压力区上限（具体价位）")
+    entry_from: Optional[float] = Field(
+        default=None,
+        description=(
+            "建议入场区下限（具体价位）。主=前高/前低突破回踩位；"
+            "辅=山腰反转形态（1h吞没/锤子/针/RSI背离）小仓位入场。无清晰信号时为 null"
+        ),
+    )
+    entry_to: Optional[float] = Field(
+        default=None,
+        description="建议入场区上限（具体价位）；无清晰信号时为 null",
+    )
+    target_1: float = Field(
+        description=(
+            "第一止盈价（T1）：到 T1 平 50% 仓位。LONG 须 > 压力，SHORT 须 < 支撑"
+        )
+    )
+    target_2: Optional[float] = Field(
+        default=None,
+        description=(
+            "第二止盈价（T2）：到 T2 再平 30% 仓位。无第二目标时可为 null，"
+            "此时决策者在 T1 平 70%、剩余 30% 走移动止损"
+        ),
+    )
+    stop_price: float = Field(
+        description=(
+            "止损参考价：设在结构失效位——主回踩=前高/前低结构点外侧；"
+            "山腰反弹=反转K线极值外侧。LONG 须 < 支撑，SHORT 须 > 压力"
+        )
+    )
+    divergence: str = Field(
+        description=(
+            "未来分化可能性：明确列出「出现什么条件则观点由 A 转为 B」的两种走向。"
+            "例如：若放量站稳压力区上沿则趋势延续可上调目标；若跌破支撑区下沿且伴随量能"
+            "放大则视为假突破、转空。必须给出可触发分化的量化/可观察条件，而非空话"
+        )
+    )
+    asof_utc: str = Field(description="本观点生成时间（UTC，系统提供）")
+
+
+class AnalystNewsPricing(BaseModel):
+    """单条新闻的定价状态与时效，供决策者决定是否利用剩余空间。"""
+
+    headline: str = Field(description="新闻标题")
+    asset: str = Field(description="影响的标的，如 BTCUSDT / ETHUSDT / SOLUSDT，或多标的用 multi")
+    event_time_utc: str = Field(description="新闻发布时间（UTC）")
+    impact_direction: str = Field(description="影响方向：BULLISH/BEARISH/NEUTRAL")
+    priced_in: str = Field(
+        description="当前已定价程度：Not priced in / Partially priced in / Fully priced in"
+    )
+    remaining_space: str = Field(
+        description=(
+            "若尚未完全定价，剩余未兑现的上涨/下跌空间（如“1-2% upside remaining”）；"
+            "若已完全定价则填“已完全定价”"
+        )
+    )
+    priced_in_by_utc: str = Field(
+        description=(
+            "预计被市场完全消化的时间点（UTC 绝对时间戳）。用于让决策者明确："
+            "在到达该时点前存在可能利用的“未定价剩余空间”窗口；到达后该事件应视为已消化、不再追。"
+            "请给出具体到分钟的时间，如 2026-08-18T12:30:00Z"
+        )
+    )
+    window_hours: float = Field(
+        default=0.0,
+        description="从当前时刻到 priced_in_by_utc 的剩余有效窗口小时数（0 表示已过或很小）",
+    )
+    note: str = Field(default="", description="补充说明（如价格是否已反映大部分等）")
+
+
+class AnalystOutput(BaseModel):
+    """市场分析师的完整结构化输出（技术面 + 新闻定价时效）。"""
+
+    market_overview: str = Field(
+        description="对 BTC/ETH/SOL 整体市场状况的简明判断（1-3 句，供决策者快速读）"
+    )
+    assets: list[AnalystAssetView] = Field(
+        description="逐标的方向与关键位判断（支撑/压力/入场区都须给具体区间）"
+    )
+    news_pricing: list[AnalystNewsPricing] = Field(
+        default_factory=list,
+        description=(
+            "每条近期相关新闻的定价状态与预计被完全消化的时间点。"
+            "旧闻/噪音可忽略；只列对交易方向有意义的条目"
         ),
     )

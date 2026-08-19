@@ -26,7 +26,8 @@ logger = logging.getLogger(__name__)
 # 允许的 thesis 记录字段
 _VALID_FIELDS = {
     "symbol", "kind", "direction", "entry_price", "stop_loss",
-    "take_profit", "thesis", "note", "parent_id", "opened_at", "updated_at",
+    "take_profit", "thesis", "note", "parent_id", "order_id",
+    "opened_at", "updated_at",
 }
 
 
@@ -106,6 +107,7 @@ class ThesisStore:
             "entry_price": fields.get("entry_price"),
             "stop_loss": fields.get("stop_loss"),
             "take_profit": fields.get("take_profit"),
+            "order_id": fields.get("order_id"),
             "thesis": thesis,
             "note": fields.get("note"),
             "parent_id": parent_id,
@@ -243,20 +245,29 @@ class ThesisStore:
         self,
         account_positions: dict[str, Any],
         open_orders_by_symbol: Optional[dict[str, list]] = None,
+        live_open_order_ids: Optional[set] = None,
     ) -> int:
         """自动清理过期条目，返回被清除的数量（含被级联删除的子孙节点）。
 
         规则（按操作类型判断其操作周期是否已结束）：
         1. kind=position（持仓理由）：该币种已无任何持仓（仓位被完全平掉）→ 删除；
-        2. kind=limit_order（挂单理由）：该币种已无未成交 LIMIT 挂单 且 无持仓
-           （挂单已撤销且不再续挂 / 挂单已成交并平仓）→ 删除；若已成交转持仓，
-           则保留待 _sync_theses 升级为 position 理由，避免误删有效条目；
+           若记录了绑定单号 order_id，则持仓列表(live 持仓)中必须能对应到该币种，
+           否则视为已平仓 → 删除；
+        2. kind=limit_order（挂单理由）：
+           - 若记录绑定单号 order_id：该单号必须仍处于未成交挂单列表(live_open_order_ids)
+             中，或已成交转化为持仓（存在持仓）；否则（单已撤 / 成交后又平掉）→ 删除；
+           - 若未记录单号（旧数据）：按原规则——该币种已无未成交 LIMIT 挂单 且 无持仓 → 删除；
         3. kind=other / 未知：无账户状态可核对，超时（超过 max_age_hours）→ 删除，
            防止上下文无限膨胀。
+
+        关键：这里以「绑定单号是否还存在于挂单/持仓列表」为准清除，即使模型忘记主动
+        COMPLETE/DELETE，只要其绑定的币安单号已不在存活列表中，系统也会自动清理，
+        防止模型自身遗忘导致理由列表残留。
 
         任一节点被判过期时，其全部子孙节点（父子层级）也一并级联删除。
         """
         open_orders_by_symbol = open_orders_by_symbol or {}
+        live_open_order_ids = live_open_order_ids or set()
         now = datetime.now().astimezone()
 
         def _has_open_limit(symbol: str) -> bool:
@@ -273,17 +284,25 @@ class ThesisStore:
         for r in self._data:
             symbol = r.get("symbol", "")
             kind = r.get("kind", "position")
+            bound_id = r.get("order_id")
             stale = False
 
             if kind == "position":
+                # 持仓理由：按「持仓列表」判断——该币种仍存有持仓即有效
                 if not _has_position(symbol):
                     stale = True
             elif kind == "limit_order":
-                # 挂单成交后该币种会以持仓形态存在（届时由 _sync_theses 升级为
-                # position 理由）。因此仅当「无未成交 LIMIT 且无持仓」时才判定过期，
-                # 避免挂单在两轮之间成交时误删本应升级的有效条目。
-                if not _has_open_limit(symbol) and not _has_position(symbol):
-                    stale = True
+                if bound_id is not None:
+                    # 有绑定单号：必须仍在该币种未成交挂单中，或由该单成交转为持仓（暂不误删）
+                    if (
+                        str(bound_id) not in live_open_order_ids
+                        and not _has_position(symbol)
+                    ):
+                        stale = True
+                else:
+                    # 旧数据无单号：退回原 symbol 级判断
+                    if not _has_open_limit(symbol) and not _has_position(symbol):
+                        stale = True
             else:  # other / 未知
                 if self.max_age_hours:
                     opened = r.get("opened_at")
@@ -373,6 +392,8 @@ class ThesisStore:
                 f"开仓/挂单价: {node.get('entry_price') or 'N/A'}  "
                 f"止损: {node.get('stop_loss') or 'N/A'}  止盈: {node.get('take_profit') or 'N/A'}"
             )
+            if node.get("order_id"):
+                lines.append(f"{indent}- 绑定币安单号(order_id): {node.get('order_id')}")
             lines.append(f"{indent}- 开始时间: {opened}")
             lines.append(f"{indent}- 理由: {node.get('thesis') or 'N/A'}")
             if node.get("note"):
