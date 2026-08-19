@@ -14,6 +14,7 @@ from agents.schemas import OrderAction, OrderType, TradeInstruction
 from config import config
 from trading.binance_client import BinanceClient, BinanceError
 from trading.risk import RiskManager
+from trading.risk_lock import RiskLockStore
 from trading.types import AccountInfo
 
 logger = logging.getLogger(__name__)
@@ -49,12 +50,25 @@ class OrderExecutor:
         risk_manager: RiskManager,
         dry_run: Optional[bool] = None,
         hedge_mode: bool = False,
+        lock_store=None,
     ) -> None:
         self.client = client
         self.risk = risk_manager
         self.dry_run = config.dry_run if dry_run is None else dry_run
         # 双向持仓模式(Hedge Mode)：下单需带 positionSide；单向模式为 None
         self.hedge_mode = hedge_mode
+        # 初始风险额度锁：开仓成交瞬间固化绝对风险敞口（USDT 本位面值=1）。
+        # 默认自建一个；调用方可传入共享实例（与风控共享，确保校验读到同一份锁）。
+        self._locks = lock_store if lock_store is not None else RiskLockStore()
+
+    def _lock_initial_risk(self, symbol: str, entry_price: float, qty: float, stop) -> None:
+        """开仓一侧定初始风险额度锁：|入场价−止损价|×数量，落盘后永久冻结。
+
+        仅当带止损时才锁（无止损开仓会被风控拦截，理论上不会到此）。
+        """
+        if stop is None or not entry_price or not qty or qty <= 0:
+            return
+        self._locks.set(symbol, entry_price, stop, abs(qty))
 
     # ---------- 工具 ----------
 
@@ -136,6 +150,7 @@ class OrderExecutor:
                     symbol=p.symbol, side=side, quantity=qty,
                     position_side=self._ps(self._pos_side(p)),
                 )
+                self._locks.clear(p.symbol)
                 logger.warning(
                     "紧急平仓 %s %s qty=%s side=%s -> %s（%s）",
                     p.symbol, p.position_amt, qty, side, order.get("status"), reason,
@@ -358,6 +373,8 @@ class OrderExecutor:
                 margin=margin,
                 notional=notional,
             )
+            # DRY_RUN 也用计划入场价/数量/止损固化学风险额度基线（便于一致校验）
+            self._lock_initial_risk(ins.symbol, entry_price, qty, ins.stop_loss)
             return base
 
         # 真实下单
@@ -390,6 +407,14 @@ class OrderExecutor:
             order_type=order_type,
             margin=margin,
             notional=notional,
+        )
+        # PENDING→FILLED 瞬间固化绝对风险额基线：取实际成交均价与成交数量；
+        # 若交易所未回传成交均价（如限价单刚挂未成交），回退到计划价/数量。
+        self._lock_initial_risk(
+            ins.symbol,
+            entry_price=float(order.get("avgPrice") or entry_price),
+            qty=float(order.get("executedQty") or qty),
+            stop=ins.stop_loss,
         )
         # 挂止损止盈（LIMIT 单未成交时 reduceOnly 保护单可能被拒，降级不致命）
         # 保护单必须用「平仓方向」：多头→SELL、空头→BUY；若误用开仓方向（多头=BUY），
@@ -518,6 +543,11 @@ class OrderExecutor:
         if ins.order_type == OrderType.LIMIT and ins.price:
             order_type = "LIMIT"
             price = self._price(symbol_info, ins.price)
+
+        # 全部平完则清除该币种风险额度锁（供下一轮开仓重新固化基线）
+        fully_closed = qty >= abs(pos.position_amt)
+        if fully_closed:
+            self._locks.clear(ins.symbol)
 
         if self.dry_run:
             logger.info(

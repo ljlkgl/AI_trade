@@ -39,6 +39,7 @@ from trading.hypothesis import ThesisStore
 from trading.market import MarketDataService
 from trading.news import NewsService
 from trading.risk import RiskManager, build_min_margin_context
+from trading.risk_lock import RiskLockStore
 from trading.rounds import RoundLog, RuntimeState
 from trading.watch import WatchStore
 
@@ -141,7 +142,9 @@ class TradingSystem:
         # 执行前逐条确认者（用 quick 模型：单条指令的轻量复核）；
         # 反思者职责已并入确认者（每轮后由确认者复盘并直接维护经验库）
         self.confirmer = Confirmer(self.llm)
-        self.risk = RiskManager()
+        # 共享风险额度锁：开仓固化基线、风控校验读到同一份、平仓清除
+        self.risk_locks = RiskLockStore()
+        self.risk = RiskManager(lock_store=self.risk_locks)
         # 启动时检查持仓模式：单向(One-way)则切换为双向(Hedge Mode)
         self.hedge_mode = False
         try:
@@ -149,7 +152,8 @@ class TradingSystem:
         except Exception as exc:  # noqa: BLE001
             logger.warning("检查持仓模式失败（按单向模式运行）: %s", exc)
         self.executor = OrderExecutor(
-            self.client, self.risk, hedge_mode=self.hedge_mode
+            self.client, self.risk, hedge_mode=self.hedge_mode,
+            lock_store=self.risk_locks,
         )
         self.theses = ThesisStore(
             max_age_hours=config.thesis_max_age_hours,
@@ -420,7 +424,7 @@ class TradingSystem:
         result["instructions_after_risk"] = [
             {
                 "symbol": i.symbol, "action": i.action.value,
-                "order_type": i.order_type.value, "price": i.price,
+                "order_type": i.order_type.value if i.order_type else None, "price": i.price,
                 "quantity": i.quantity, "margin": i.margin, "leverage": i.leverage,
                 "stop_loss": i.stop_loss, "take_profit": i.take_profit,
                 "reason": i.reason,

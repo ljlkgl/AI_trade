@@ -19,6 +19,7 @@ import html
 import importlib
 import json
 import logging
+from logging.handlers import TimedRotatingFileHandler
 import socket
 import threading
 import time
@@ -31,6 +32,42 @@ from config import config
 from trading.binance_client import BinanceClient
 
 logger = logging.getLogger(__name__)
+
+# 独立日志：web 日志只写入 logs/web.log，不直接打印到控制台。按天滚动，最多保留一天。
+_LOG_DIR = Path(__file__).resolve().parent / "logs"
+_LOG_FILE = _LOG_DIR / "web.log"
+
+
+def _setup_logging() -> None:
+    """为本模块 logger 挂独立文件 handler（rolling 按天、最多保留一天）。
+
+    幂等：热更新 importlib.reload 会重新执行模块，但 getLogger(__name__) 返回同一
+    logger 实例；通过 baseFilename 判断，避免重复挂 handler。
+    """
+    if any(
+        isinstance(h, TimedRotatingFileHandler)
+        and getattr(h, "baseFilename", "") == str(_LOG_FILE)
+        for h in logger.handlers
+    ):
+        return
+    _LOG_DIR.mkdir(parents=True, exist_ok=True)
+    handler = TimedRotatingFileHandler(
+        str(_LOG_FILE), when="midnight", interval=1,
+        backupCount=0, encoding="utf-8",
+    )
+    handler.setFormatter(
+        logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+    )
+    handler.setLevel(logging.DEBUG)
+    logger.addHandler(handler)
+    # 本模块统一收敛到 DEBUG，确保 INFO/WARNING/ERROR 都能写文件
+    # （根 logger 默认 WARNING，若不加会过滤掉 INFO 请求日志）
+    logger.setLevel(logging.DEBUG)
+    # 不向父 logger 传播，避免被根 handler 打印到控制台
+    logger.propagate = False
+
+
+_setup_logging()
 
 _STATE_DIR = Path(__file__).resolve().parent / "state"
 # 不把完整挂单列表塞进 JSON API 太长时，轮次记录展示数量上限

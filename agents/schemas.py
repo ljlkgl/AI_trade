@@ -34,6 +34,15 @@ class OrderType(str, Enum):
     LIMIT = "LIMIT"     # 限价单（挂单）
 
 
+# 实际会下单的动作：必须填写 order_type（漏填=违规）。
+# 相对地，HOLD/CANCEL_ORDERS/FLATTEN/SET_SL_TP 不产生订单，order_type 允许为 null。
+_ORDER_ACTIONS_REQUIRING_TYPE = {
+    OrderAction.OPEN_LONG, OrderAction.OPEN_SHORT,
+    OrderAction.CLOSE_LONG, OrderAction.CLOSE_SHORT,
+    OrderAction.REPLACE_LIMIT,
+}
+
+
 class TakeProfitLevel(BaseModel):
     """单档止盈：到价后按持仓比例（fraction）市价平仓。供分批止盈（多档）使用。"""
 
@@ -58,8 +67,14 @@ class TradeInstruction(BaseModel):
 
     symbol: str = Field(description="永续合约交易对，如 BTCUSDT / ETHUSDT / SOLUSDT")
     action: OrderAction = Field(description="交易动作，见 OrderAction")
-    order_type: OrderType = Field(
-        default=OrderType.MARKET, description="订单类型：MARKET 市价 / LIMIT 限价挂单"
+    order_type: Optional[OrderType] = Field(
+        default=None,
+        description=(
+            "订单类型：MARKET 市价 / LIMIT 限价挂单。仅实际下单动作"
+            "（OPEN_LONG/OPEN_SHORT/CLOSE_LONG/CLOSE_SHORT/REPLACE_LIMIT）需要明确指定；"
+            "HOLD/CANCEL_ORDERS/FLATTEN/SET_SL_TP 等不产生订单的动作请填写 null。"
+            "注意：请勿把 null 误填为未定义值，系统对 null 无歧义地按非下单动作处理"
+        ),
     )
     price: Optional[float] = Field(
         default=None, description="LIMIT 挂单价格；MARKET 单不填"
@@ -144,6 +159,16 @@ class TradeInstruction(BaseModel):
                 raise ValueError(
                     f"{self.symbol} SET_SL_TP 必须提供 stop_loss 或 take_profit 至少一个"
                 )
+        return self
+
+    @model_validator(mode="after")
+    def _require_order_type_on_order_actions(self):
+        """实际下单动作必须填写 order_type（漏填=违规报错）。"""
+        if self.action in _ORDER_ACTIONS_REQUIRING_TYPE and self.order_type is None:
+            raise ValueError(
+                f"{self.symbol} {self.action.value} 必须填写 order_type=MARKET/LIMIT（漏填违规）；"
+                f"仅 HOLD/CANCEL_ORDERS/FLATTEN/SET_SL_TP 允许 order_type 为 null"
+            )
         return self
 
     @model_validator(mode="after")
@@ -344,6 +369,9 @@ class TradingDecision(BaseModel):
 # 开仓（OPEN_LONG/OPEN_SHORT）只输出 margin（初始保证金 USDT），数量由系统自动换算；
 # 挂单管理（REPLACE_LIMIT/CANCEL_ORDERS/SET_SL_TP）与平仓才用到 quantity（币数量）；
 # 平仓可不填 quantity（缺省=全部平掉），也可填部分数量做部分平仓（如平 50%）。
+# order_type：实际下单动作（OPEN_LONG/OPEN_SHORT/CLOSE_LONG/CLOSE_SHORT/REPLACE_LIMIT）
+# 必须设为 MARKET/LIMIT，漏填=违规被拒；不产生订单的动作（HOLD/CANCEL_ORDERS/FLATTEN/SET_SL_TP）
+# 一律写 null。
 # thesis_ops 为对「操作理由列表」的操作（可空）：ADD 新增（可带 parent_id 建立父子层级，
 # 如开仓=父、其止盈止损=各为子编号，层级可两层以上）/ UPDATE 修改 / COMPLETE 结束（标注完成记号，
 # 系统自动级联删除该编号及其全部子编号）/ DELETE 删除单个编号。
@@ -369,7 +397,7 @@ DECISION_JSON_SCHEMA_HINT = """{
     {
       "symbol": "BTCUSDT",
       "action": "CANCEL_ORDERS",
-      "order_type": "LIMIT",
+      "order_type": null,
       "price": null,
       "quantity": null,
       "margin": null,
@@ -416,6 +444,19 @@ DECISION_JSON_SCHEMA_HINT = """{
       "stop_loss": 96000,
       "take_profit": 101000,
       "reason": "行情已上移，止损止盈同步上移锁定利润",
+      "side": null
+    },
+    {
+      "symbol": "BTCUSDT",
+      "action": "HOLD",
+      "order_type": null,
+      "price": null,
+      "quantity": null,
+      "margin": null,
+      "leverage": null,
+      "stop_loss": null,
+      "take_profit": null,
+      "reason": "价格仍在原入场区间内震荡，未突破关键支撑/阻力，无新增驱动，维持现有仓位不动",
       "side": null
     }
   ],

@@ -118,6 +118,8 @@ class RiskManager:
         max_leverage: Optional[int] = None,
         min_notional: Optional[float] = None,
         min_margin: Optional[float] = None,
+        max_sl_risk_ratio: Optional[float] = None,
+        lock_store=None,
     ) -> None:
         self.max_position_ratio = (
             max_position_ratio or config.max_position_ratio
@@ -128,6 +130,14 @@ class RiskManager:
         self.max_leverage = max_leverage or config.max_leverage
         self.min_notional = min_notional or config.min_notional
         self.min_margin = min_margin if min_margin is not None else config.min_margin
+        # 止损绝对风险上限比例（占权益）；代码级硬约束，防止损漂移
+        self.max_sl_risk_ratio = (
+            max_sl_risk_ratio
+            if max_sl_risk_ratio is not None
+            else (config.max_sl_risk_ratio if hasattr(config, "max_sl_risk_ratio") else 0.02)
+        )
+        # 初始风险额度锁（RiskLockStore），用于校验 SET_SL_TP 不扩大锁定亏损
+        self.lock_store = lock_store
 
     # ---------- 辅助 ----------
 
@@ -138,6 +148,47 @@ class RiskManager:
             if p.symbol == symbol:
                 return p
         return None
+
+    # ---------- 止损漂移硬约束 ----------
+
+    @staticmethod
+    def _abs_risk(entry: float, sl: float, qty: float) -> float:
+        """单品种绝对亏损额（USDT）= |开仓均价 − 止损价| × 持仓数量（USDT 本位，面值=1）。"""
+        if not entry or not sl or not qty or qty <= 0:
+            return 0.0
+        return abs(float(entry) - float(sl)) * float(qty)
+
+    def _check_stop_risk(self, errors, symbol, entry, total_qty, proposed_sl, equity):
+        """校验新止损是否违反物理风控铁律，违规则追加 error。
+
+        规则1（2% 铁律）：绝对亏损额 ≤ 权益 × max_sl_risk_ratio；
+        规则2（风险额度锁）：若该币种已有初始锁定风险额度 locked_risk，则绝对亏损额只许缩小、
+        不许超过 locked_risk（想扩大止损距离必须减仓）。
+        """
+        rk = self._abs_risk(entry, proposed_sl, total_qty)
+        if rk <= 0:
+            return
+        # 规则1：账户权益比例硬上限（无论是否有锁，都强制）
+        cap = equity * self.max_sl_risk_ratio
+        if rk > cap + 1e-9:
+            errors.append(
+                f"{symbol}: 止损绝对风险 {rk:.4f}U "
+                f"（=|开仓均价{entry:.6g}−新止损{proposed_sl:.6g}|×持仓{total_qty:.6g}) "
+                f"超过账户权益{self.max_sl_risk_ratio:.0%} 上限 {cap:.4f}U"
+            )
+            return
+        # 规则2：风险额度锁（初始基线）—— 绝对亏损只许缩小、不许扩大
+        locked = self.lock_store.get(symbol) if self.lock_store else None
+        if locked:
+            locked_u = locked.get("locked_risk_usdt")
+            if locked_u and rk > locked_u + 1e-9:
+                errors.append(
+                    f"{symbol}: 新止损将绝对亏损扩大至 {rk:.4f}U，"
+                    f"违反初始锁定风险额度 {locked_u:.4f}U。"
+                    f"止损与持仓数量联动：想扩大止损距离必须同步减仓至 "
+                    f"{locked_u / (abs(float(entry) - float(proposed_sl)) or 1):.6g}，"
+                    f"否则系统按漂移风险拦截"
+                )
 
     # ---------- 指令校验 ----------
 
@@ -184,6 +235,11 @@ class RiskManager:
                         errors.append(f"{instruction.symbol}: 多仓止损价需低于当前价 {ref_price}")
                     if pos.position_amt < 0 and sl <= ref_price:
                         errors.append(f"{instruction.symbol}: 空仓止损价需高于当前价 {ref_price}")
+                    # 物理风控铁律：止损漂移校验（2% 上限 + 初始风险额度锁）
+                    self._check_stop_risk(
+                        errors, instruction.symbol,
+                        pos.entry_price, abs(pos.position_amt), sl, equity,
+                    )
                 if tp is not None:
                     if pos.position_amt > 0 and tp <= ref_price:
                         errors.append(f"{instruction.symbol}: 多仓止盈价需高于当前价 {ref_price}")
@@ -244,6 +300,22 @@ class RiskManager:
                     errors.append(f"{instruction.symbol}: 多单止损价需低于开仓价")
                 if instruction.action == OrderAction.OPEN_SHORT and instruction.stop_loss <= (instruction.price or mark_price):
                     errors.append(f"{instruction.symbol}: 空单止损价需高于开仓价")
+                # 物理风控铁律：开仓/加仓的止损绝对风险校验（2% 上限 + 风险额度锁）。
+                # 开仓数量 = 名义价值/开仓价；若为已有持仓的加仓，则按当前+新仓的总数量与
+                # 合并均价校验，确保加仓不突破初始锁定风险额度。
+                if entry > 0 and margin and margin > 0:
+                    new_qty = notional / entry if margin and lev else 0
+                    cur_qty = abs(pos.position_amt) if pos else 0.0
+                    total_qty = cur_qty + new_qty
+                    if cur_qty > 0:
+                        # 加权合并均价：已有持仓均价 与 新仓开仓价按数量加权
+                        combined_entry = (pos.position_amt * pos.entry_price + new_qty * entry) / total_qty
+                    else:
+                        combined_entry = entry
+                    self._check_stop_risk(
+                        errors, instruction.symbol,
+                        combined_entry, total_qty, instruction.stop_loss, equity,
+                    )
 
         # 平仓类：校验数量不超过持仓
         if instruction.action in (OrderAction.CLOSE_LONG, OrderAction.CLOSE_SHORT, OrderAction.FLATTEN):

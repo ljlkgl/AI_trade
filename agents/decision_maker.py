@@ -183,6 +183,18 @@ Your job:
       Cancel the limit order (CANCEL_ORDERS) and wait for the next opportunity.
     - Your job: specify order type (LIMIT/MARKET), price, quantity/margin, stop_loss.
       The system executes. You do not need to describe execution logic or trigger conditions.
+23. order_type FIELD (订单类型字段): REQUIRED — not optional. Fill in "MARKET" or "LIMIT" for
+    every action that actually places an order (OPEN_LONG / OPEN_SHORT / CLOSE_LONG / CLOSE_SHORT /
+    REPLACE_LIMIT); omitting it is a REJECTED violation. For actions that perform NO order placement
+    — HOLD, CANCEL_ORDERS, FLATTEN, SET_SL_TP — you MUST set "order_type" to null. Never omit it,
+    never use an invented value; null for those actions is expected and accepted.
+24. POSITION SIZING (仓位计算，逐仓 ISOLATED): 计算开仓名义价值与可开数量时，以你实际投入的
+    开仓保证金 margin 乘以杠杆倍数为准；需要重仓时，margin 可取到整个账户可用余额上限。
+    - 名义价值 = margin × 杠杆倍数
+    - 可开数量 = 名义价值 / 开仓价 = margin × 杠杆 / 价
+    - 例如：可用余额 8U、15 倍杠杆，若满仓开（margin=8U），名义价值即 120U，可开数量 = 120 / 价。
+    - 务必据此计算可开数量，不要自行臆想缩小仓位；只要 margin ≤ 可用余额 且 ≥ 最少初始保证金
+      即可（杠杆上限另受风控硬约束）。本系统为逐仓（ISOLATED），非全仓，别按全仓口径臆断金额。
 
 Output ONLY valid JSON. No markdown fences, no extra text.
 """
@@ -310,6 +322,21 @@ class DecisionMaker:
             + "   撤销/改单不影响已有持仓，也无需带止损\n"
             + "- 止盈止损调整：对已有持仓可用 SET_SL_TP 随时改止损/止盈（至少给一个），\n"
             + "   系统先撤销旧保护单再按新价重挂；多仓 止损<现价<止盈，空仓 止损>现价>止盈\n"
+            + "\n"
+            + "【风控调整细则（止损与仓位联动）】\n"
+            + "24. 绝对风险硬约束：任何单品种的 (开仓均价 − 止损价) × 持仓数量（绝对亏损额，USDT）"
+            + "不得大于账户权益的 2%，亦不得超过该仓初始锁定风险额度。若需下移止损（扩大亏点数），"
+            + "必须同比例减少持仓数量，使绝对亏损额不增反减；否则系统会硬性驳回。\n"
+            + "25. 严禁类型（“追跌式”止损漂移）：严禁仅因为短期(15m/1h)均线或布林带随K线自然漂移而下移止损。"
+            + "若支撑位因放量长阴被实体击穿，应优先选择平仓离场，而非下移止损硬扛——这是严重的“追跌”错误，绝对禁止。\n"
+            + "26. 允许正向调整（移动止损，保护利润）：仅当价格触及/突破第一目标位(Target_1) 或出现大幅盈利时，"
+            + "允许将止损上移至成本价（保本）或更高。\n"
+            + "27. 有条件地下行（负向移动）：仅当出现全新重大基本面利空（如比预期更鹰派的美联储、突发战争/黑天鹅），"
+            + "或价格在 4h 级别明确跌穿前低支撑（结构性破坏）时，才允许小幅下移止损；并优先走下列替代方案。\n"
+            + "28. 替代方案优先（支撑变弱时的更优应对）：当认为“支撑位下移、原止损有被扫掉风险”时，切勿下调止损去博反弹，"
+            + "优先选择：A) 市价平仓离场（CLOSE/FLATTEN），避开风险，等企稳再进；B) 若趋势仍在但短期波动大，减掉一半仓位"
+            + "（CLOSE 半仓），剩余仓位止损保持不变，如此被扫损时亏损金额也直接减半。加仓同理：想加仓就必须收紧止损距离，"
+            + "确保绝对亏损额仍不超过初始锁定风险额度。\n"
             + "\n"
             + "开仓指令字段说明：输出 margin（初始保证金 USDT，必填）、leverage、stop_loss；\n"
             + "quantity 由系统自动换算（= margin × 杠杆 / 开仓价），开仓时 quantity 置 null。\n"

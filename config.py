@@ -74,6 +74,9 @@ class Config:
         self.min_notional = _get_float("MIN_NOTIONAL", 20.0)
         # 单笔开仓所需初始保证金下限（USDT）；名义价值 = 保证金 × 杠杆
         self.min_margin = _get_float("MIN_MARGIN", 2.5)
+        # 单品种止损绝对风险上限（占总权益比例）：(|开仓均价−止损价| × 持仓数量) ≤ 权益×此比例。
+        # 此为代码级硬约束，配合风险额度锁（risk_locks）阻止止损漂移。
+        self.max_sl_risk_ratio = _get_float("MAX_SL_RISK_RATIO", 0.02)
         self.dry_run: bool = _get_bool("DRY_RUN", True)
 
         # ---- 运行参数 ----
