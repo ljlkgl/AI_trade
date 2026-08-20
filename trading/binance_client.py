@@ -158,6 +158,11 @@ class BinanceClient:
         self._symbols_cache[symbol] = sym
         return sym
 
+    def refresh_symbol_info(self, symbol: str) -> SymbolInfo:
+        """强制刷新某币种精度缓存（清除旧缓存后重新拉取），返回新 SymbolInfo。"""
+        self._symbols_cache.pop(symbol, None)
+        return self.get_symbol_info(symbol)
+
     # ---------------- 账户（签名接口） ----------------
 
     def get_position_mode(self) -> bool:

@@ -28,6 +28,22 @@ def ceil_to_step(value: float, step: float) -> float:
     return n * step
 
 
+def _round_step_half(value: float, step: float) -> float:
+    """按 stepSize 四舍五入（ROUND_HALF_UP），与 OrderExecutor._quantity 同口径。
+
+    用于把「目标名义=保证金×杠杆 / 开仓价」换算的数量折叠到交易所实际可下的数量，
+    从而得到与 executor 真正会发送一致的「实际可成交名义」。避免风控用目标名义
+    误判高价币种的有效订单（如 BTC 取整到最小 0.001 已远超 min_notional）。
+    """
+    if step <= 0:
+        return value
+    from decimal import Decimal, ROUND_HALF_UP
+
+    dstep = Decimal(str(step))
+    n = (Decimal(str(value)) / dstep).to_integral_value(rounding=ROUND_HALF_UP)
+    return float((n * dstep).quantize(dstep))
+
+
 def min_margin_for(
     symbol_info: SymbolInfo,
     price: float,
@@ -267,11 +283,22 @@ class RiskManager:
                 notional = margin * lev
                 # 名义价值下限 = 系统下限 与 交易所 MIN_NOTIONAL 的较大值（二者都需满足）
                 min_notional = max(self.min_notional, symbol_info.min_notional)
-                if notional < min_notional:
+                # 实际可成交名义 = 按交易所 step 取整后的数量 × 开仓价（与 OrderExecutor._quantity
+                # 同口径）。高价币种（如 BTC≈7 万）即便取整到最小 0.001 也已远超 min_notional，
+                # 若用「目标名义=保证金×杠杆」会低于实际可成交值，误杀本可有效成交的订单。
+                if entry > 0 and symbol_info.qty_step > 0:
+                    q_fold = _round_step_half(notional / entry, symbol_info.qty_step)
+                    real_notional = q_fold * entry
+                else:
+                    q_fold = None
+                    real_notional = notional
+                if real_notional < min_notional:
+                    _qtxt = f"数量 {notional / entry:.6g} 按 step 取整为 {q_fold:.6g}" if q_fold is not None else ""
                     errors.append(
-                        f"{instruction.symbol}: 单笔名义价值 {notional:.2f} "
-                        f"低于最小限制 {min_notional:.2f} USDT"
-                        f"（名义价值=保证金×杠杆，含交易所 MIN_NOTIONAL {symbol_info.min_notional:.2f}）"
+                        f"{instruction.symbol}: 实际可成交名义 {real_notional:.2f} USDT"
+                        f"（{_qtxt}）低于最小限制 {min_notional:.2f} USDT"
+                        f"（含交易所 MIN_NOTIONAL {symbol_info.min_notional:.2f}；"
+                        f"名义=取整后数量×开仓价）"
                     )
                 if margin < self.min_margin:
                     errors.append(
@@ -284,15 +311,12 @@ class RiskManager:
                         f"{instruction.symbol}: 开仓保证金 {margin:.4f} USDT "
                         f"超过可用余额 {account.available_balance:.4f} USDT"
                     )
-                # 换算数量（保证金×杠杆/开仓价）按 step 取整后不得低于交易所最小下单量
-                if entry > 0 and symbol_info.qty_step > 0:
-                    qty = notional / entry
-                    q_rounded = int(round(qty / symbol_info.qty_step)) * symbol_info.qty_step
-                    if q_rounded < symbol_info.min_qty:
-                        errors.append(
-                            f"{instruction.symbol}: 保证金 {margin:.4f}×杠杆{lev} 换算数量 "
-                            f"{q_rounded:.6g} 低于最小下单量 {symbol_info.min_qty:.6g}（需增大保证金或杠杆）"
-                        )
+                # 换算数量按 step 取整后不得低于交易所最小下单量
+                if q_fold is not None and q_fold < symbol_info.min_qty:
+                    errors.append(
+                        f"{instruction.symbol}: 保证金 {margin:.4f}×杠杆{lev} 换算数量 "
+                        f"{q_fold:.6g} 低于最小下单量 {symbol_info.min_qty:.6g}（需增大保证金或杠杆）"
+                    )
             if lev > self.max_leverage:
                 errors.append(
                     f"{instruction.symbol}: 杠杆 {lev} 超过上限 {self.max_leverage}"

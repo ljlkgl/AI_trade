@@ -453,16 +453,32 @@ class OrderExecutor:
         except BinanceError as exc:
             logger.warning("设置杠杆失败: %s", exc)
 
-        order = self.client.place_order(
-            symbol=ins.symbol,
-            side=side,
-            order_type=order_type,
-            quantity=qty,
-            price=price,
-            time_in_force="GTC" if order_type == "LIMIT" else None,
-            client_order_id=self._client_order_id("open"),
-            position_side=self._ps("LONG" if ins.action == OrderAction.OPEN_LONG else "SHORT"),
-        )
+        def _place(q: float, p):
+            return self.client.place_order(
+                symbol=ins.symbol,
+                side=side,
+                order_type=order_type,
+                quantity=q,
+                price=p,
+                time_in_force="GTC" if order_type == "LIMIT" else None,
+                client_order_id=self._client_order_id("open"),
+                position_side=self._ps("LONG" if ins.action == OrderAction.OPEN_LONG else "SHORT"),
+            )
+
+        # _quantity/_price 已按交易所 step/tick 取整，正常情况下不会超精度；此处仅作保险：
+        # 当交易所返回「Precision is over the maximum」时（常见于交易所调整 step/tick 或
+        # 精度缓存过期），强制刷新精度并重新取整后重试一次，避免一次有效的开仓被误拒。
+        try:
+            order = _place(qty, price)
+        except BinanceError as exc:
+            if "precision" not in str(exc).lower():
+                raise
+            logger.warning("%s 下单精度被拒(%s)，刷新精度并重新取整后重试一次", ins.symbol, exc)
+            fresh = self.client.refresh_symbol_info(ins.symbol)
+            order = _place(
+                self._quantity(fresh, notional / entry_price),
+                self._price(fresh, ins.price) if order_type == "LIMIT" else None,
+            )
         result = dict(base)
         result.update(
             status="OPENED",
