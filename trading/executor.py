@@ -200,9 +200,9 @@ class OrderExecutor:
         raise ValueError(f"未知动作: {ins.action}")
 
     def _cancel_orders(self, ins: TradeInstruction, base: dict) -> dict:
-        """撤销该币种全部未成交 LIMIT 挂单（不影响持仓的止盈止损保护单）。"""
+        """撤销该币种全部未成交挂单（含主 LIMIT 单及其配套止盈止损 algo 条件单）。"""
         if self.dry_run:
-            logger.info("[DRY_RUN] %s CANCEL_ORDERS（撤销全部未成交限价单）", ins.symbol)
+            logger.info("[DRY_RUN] %s CANCEL_ORDERS（撤销全部未成交挂单，含 algo 止盈止损）", ins.symbol)
             base.update(status="DRY_RUN")
             return base
         try:
@@ -214,19 +214,36 @@ class OrderExecutor:
             base.update(status="FAILED", error=str(exc))
         return base
 
-    def _cancel_pending_limits(self, symbol: str) -> list[int]:
-        """撤销该币种全部未成交 LIMIT 挂单（保留 STOP/TP 保护单），返回 orderId 列表。"""
-        cancelled: list[int] = []
+    def _cancel_pending_limits(self, symbol: str) -> list[Any]:
+        """撤销该币种全部未成交挂单，返回被撤销的 ID 列表（orderId 或 algoId）。
+
+        包含两类：
+        1. 普通 LIMIT 挂单（主挂单）；
+        2. 配套的 algo 条件单（STOP_MARKET / TAKE_PROFIT_MARKET 止盈止损）。
+
+        修复「撤主挂单后其止盈止损 algo 单未随同取消」的遗留单问题：主挂单一经撤销，
+        挂靠它的 algo 条件单也必须一并取消，否则会在交易所残留幽灵 algo 单，与系统
+        内存 / 账户实际状态脱节。
+        """
+        cancelled: list[Any] = []
+        # 1）普通 LIMIT 挂单
         for order in self.client.get_open_orders(symbol):
             if order.get("type") == "LIMIT":
                 self.client.cancel_order(symbol, order["orderId"])
                 cancelled.append(order["orderId"])
+        # 2）algo 条件单（止盈止损），主挂单撤销时应一并取消，避免残留
+        for order in self.client.get_open_algo_orders(symbol):
+            if order.get("algoStatus") == "NEW":
+                o_id = order.get("algoId")
+                if o_id not in cancelled:
+                    self.client.cancel_algo_order(symbol, o_id)
+                    cancelled.append(o_id)
         return cancelled
 
     def _replace_limit(self, ins: TradeInstruction, symbol_info, base: dict) -> dict:
-        """更改挂单：先撤销该币种全部 LIMIT 挂单，再按新价格/数量重新挂 LIMIT 单。
+        """更改挂单：先撤销该币种全部挂单（含配套 algo 止盈止损），再按新价格/数量重挂 LIMIT。
 
-        仅撤销未成交的 LIMIT 单，保留持仓的止损/止盈保护单（STOP/TP）。
+        落单前先把旧入口单及其 algo 单清空，避免与旧挂单/旧 algo 单并存冲突。
         """
         qty = self._quantity(symbol_info, ins.quantity or 0)
         price = self._price(symbol_info, ins.price)

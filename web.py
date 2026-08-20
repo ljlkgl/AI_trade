@@ -609,16 +609,54 @@ def _render(status: dict[str, Any]) -> str:
   var pw = params.get("password") || "";
   var main = document.querySelector("main.main");
   var ts = document.getElementById("refreshTs");
+
+  // 收集可能承载滚动的容器：.main 与顶层滚动元素都要覆盖，
+  // 避免某些环境（如 body overflow:hidden 不生效、手机端 WebView）滚动落在
+  // document.scrollingElement / window 上而被漏掉、导致刷新后被拉回顶部。
+  function collectScrollers(){{
+    var list = [];
+    if (main) list.push(main);
+    var se = document.scrollingElement || document.documentElement;
+    if (se && se !== main) list.push(se);
+    if (document.documentElement && document.documentElement !== main
+        && document.documentElement !== se) list.push(document.documentElement);
+    if (document.body && document.body !== main && document.body !== se
+        && document.body !== document.documentElement) list.push(document.body);
+    return list;
+  }}
+
+  function readScroll(scrollers){{
+    var sc = 0;
+    for (var i = 0; i < scrollers.length; i++){{
+      var v = scrollers[i].scrollTop || 0;
+      if (v > sc) sc = v;
+    }}
+    return sc;
+  }}
+
+  function restoreScroll(scrollers, sc, skip){{
+    if (sc <= 0) return;
+    for (var i = 0; i < scrollers.length; i++){{
+      if (scrollers[i] === skip) continue;
+      scrollers[i].scrollTop = sc;
+    }}
+  }}
+
   function refresh(){{
-    var sc = main ? main.scrollTop : (window.scrollY || 0);
+    var scrollers = collectScrollers();
+    var sc = readScroll(scrollers);
     fetch(location.pathname + "?password=" + encodeURIComponent(pw), {{cache:"no-store"}})
       .then(function(r){{ if(!r.ok) throw new Error(r.status); return r.text(); }})
       .then(function(html){{
         var doc = new DOMParser().parseFromString(html, "text/html");
         var nm = doc.querySelector("main.main");
-        if (nm && main) {{ main.innerHTML = nm.innerHTML; main.scrollTop = sc; }}
+        if (nm && main) main.innerHTML = nm.innerHTML;
         var nt = doc.getElementById("refreshTs");
         if (nt && ts) ts.textContent = nt.textContent;
+        // 下一帧恢复滚动位置，避免替换 innerHTML 瞬时高度变化导致位置抖动
+        requestAnimationFrame(function(){{
+          restoreScroll(collectScrollers(), sc, main);
+        }});
       }})
       .catch(function(){{ /* 瞬时/网络错误静默，下轮重试 */ }});
   }}
