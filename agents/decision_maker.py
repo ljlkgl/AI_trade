@@ -142,17 +142,22 @@ Your job:
    [{"symbol": "BTCUSDT", "condition": "price_above", "value": 102000, "note": "why this level",
      "volume_mult": 1.5, "duration_seconds": 300}]
    - price_above: wake when price >= value; price_below: wake when price <= value.
-   - volume_mult (optional, default 0): trigger only if the current candle's volume >= volume_mult ×
-     average volume. Use it to quantify "放量突破" (e.g. 1.5 = volume 1.5x the average), so a quiet
-     drift through a level does not wake you.
+   - volume_mult is ACCEPTED but is NOT a wake gate — the system no longer skips waking because of
+     low volume. Only one thing confirms a wake: price staying beyond the level for duration_seconds.
    - duration_seconds (optional, default 0): require price to STAY beyond the level for this many
      seconds (e.g. 300) before waking, filtering out 1-min price spikes/noise.
    - Useful for: entering on a pullback/breakout, re-checking a stop level, monitoring risk.
    - An EMPTY list clears all previous conditions; a non-empty list REPLACES the previous set.
    - Conditions are one-shot (cleared once triggered) and auto-expire after ~24h.
+   - Cooldown: after being woken, the system blocks a second wake for 10 minutes; if several
+     conditions are met meanwhile, they are unified into a single wake once the cooldown ends.
+   - When you ARE woken by a condition, FIRST check the other wake conditions shown at the very top of
+     the prompt: if any are ALSO close to triggering (price near their threshold), cancel or adjust
+     them (remove, raise the level, or merge) so they don't wake you again shortly after — avoid
+     leaving many near-threshold conditions that fire one after another.
    - Prefer pullback/mean-reversion conditions (price_below a support you want to buy, price_above a
-     resistance you want to short) over chasing breakouts; set volume_mult + duration_seconds when the
-     level is near current price so short-term noise does not wake the desk.
+     resistance you want to short) over chasing breakouts; set duration_seconds when the level is
+     near current price so short-term noise does not wake the desk.
 18. TRADING HORIZON & MULTI-TIMEFRAME HIERARCHY: SWING positions (hours to days), not scalps.
     - PRIMARY: 4-hour chart — Bollinger Bands, moving averages (SMA/EMA) and MA-structure.
       Base ALL direction and stop-loss placement on these 4h indicator zones.
@@ -268,10 +273,12 @@ class DecisionMaker:
         open_orders_by_symbol: dict | None = None,
         min_margin_context: str = "",
         last_round_feedback: str = "",
+        current_watch_context: str = "",
     ) -> TradingDecision:
         user_content = (
             f"【本账户可交易标的，仅限以下合约（来自配置 SYMBOLS）】：{', '.join(config.symbols)}\n\n"
-            "市场分析报告（含结构性支撑/阻力、T1/T2目标、止损价）：\n"
+            + (current_watch_context + "\n\n" if current_watch_context else "")
+            + "市场分析报告（含结构性支撑/阻力、T1/T2目标、止损价）：\n"
             + market_report
             + "\n\n"
             + "新闻面信息（含事件时间/方向/定价状态/过期时间）：\n"
@@ -324,8 +331,9 @@ class DecisionMaker:
             + "若价格正向你方向强势延伸、远离最近支撑阻力，不要追进去，等待回调；"
             + "没有好的入场位时，本轮回合完全不动（HOLD/不产生新指令）也是正确决定；"
             + "长线观点同样要选在 4h/1h 图上的支撑/阻力位入场，而不是现价在哪就在哪追\n"
-            + "- 唤醒条件（watch_conditions）建议配合量能与时间确认：volume_mult（放量倍数，如 1.5）"
-            + "与 duration_seconds（价格需站稳的秒数，如 300），避免噪声触发；优先设回调位而非追突破位\n"
+            + "- 唤醒条件（watch_conditions）用 duration_seconds（价格需站稳的秒数，如 300）做时间确认，"
+            + "避免噪声触发；不再以量能不足为由拒唤醒（volume_mult 仅保留不参与触发判定），优先设回调位而非追突破位；"
+            + "被唤醒后系统有 10 分钟冷却，多个条件同触也统一在冷却结束后一次唤醒\n"
             + "- 挂单管理：未成交限价单可撤销（CANCEL_ORDERS，只给 symbol）或更改\n"
             + "  （REPLACE_LIMIT，必须给 side=BUY/SELL、quantity（币数量）、新 price）；挂单不占保证金，\n"
             + "   撤销/改单不影响已有持仓，也无需带止损\n"

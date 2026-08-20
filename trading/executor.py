@@ -6,6 +6,7 @@ DRY_RUN 模式下只打印不真实下单。
 from __future__ import annotations
 
 import logging
+import time
 import uuid
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Any, Optional
@@ -82,12 +83,22 @@ class OrderExecutor:
             return pos.position_side
         return "LONG" if pos.position_amt > 0 else "SHORT"
 
+    @staticmethod
+    def _prec_dec(precision, fallback_step) -> Decimal:
+        """下单精度的 Decimal 步长：优先用交易所精度 precision，退化用 stepSize。"""
+        if precision is not None and int(precision) >= 0:
+            return Decimal(1).scaleb(-int(precision))
+        return Decimal(str(fallback_step))
+
     def _quantity(self, symbol_info, qty: float) -> float:
-        q = round_to_step(abs(qty), symbol_info.qty_step)
-        return float(q)
+        # 先按 stepSize 量化去除浮点噪声，再显式裁剪到交易所允许的小数位，
+        # 双保险保证绝不超过 Precision 上限。
+        d = Decimal(str(round_to_step(abs(qty), symbol_info.qty_step)))
+        return float(d.quantize(self._prec_dec(symbol_info.qty_precision, symbol_info.qty_step)))
 
     def _price(self, symbol_info, price: float) -> float:
-        return float(round_price(price, symbol_info.price_tick))
+        d = Decimal(str(round_price(price, symbol_info.price_tick)))
+        return float(d.quantize(self._prec_dec(symbol_info.price_precision, symbol_info.price_tick)))
 
     def _client_order_id(self, tag: str) -> str:
         return f"{tag}{uuid.uuid4().hex[:12]}"
@@ -207,12 +218,50 @@ class OrderExecutor:
             return base
         try:
             cancelled = self._cancel_pending_limits(ins.symbol)
-            logger.info("%s 已撤销限价挂单: %d 笔", ins.symbol, len(cancelled))
+            unresolved = self._confirm_cancel(ins.symbol, cancelled)
+            logger.info(
+                "%s 已撤销挂单: %d 笔%s",
+                ins.symbol, len(cancelled),
+                f", 未确认消失 {len(unresolved)}:{unresolved}" if unresolved else "",
+            )
             base.update(status="CANCELLED", cancelled_count=len(cancelled),
                         cancelled_ids=cancelled)
+            if unresolved:
+                logger.warning(
+                    "%s 撤单后仍有 %d 笔未从交易所消失（最终一致或端点未清除，需跟进）: %s",
+                    ins.symbol, len(unresolved), unresolved,
+                )
+                base["unconfirmed_cancel_ids"] = unresolved
         except BinanceError as exc:
             base.update(status="FAILED", error=str(exc))
         return base
+
+    def _confirm_cancel(self, symbol: str, ids: list[Any]) -> list[Any]:
+        """撤单后确认目标订单已从交易所消失；仍存在的重试撤销，返回仍未消失的 ID 列表。
+
+        币安撤单是异步的（最终一致），仅信任返回码会把撤单当成已生效。这里对目标
+        （含普通 orderId 与 algoId）做至多三轮回查，若仍在 open orders / algo 列表则
+        用已修正的逻辑（普通 LIMIT + algo 条件单）再次撤销；三轮后仍未消失则上报，
+        交由本轮/反思层知晓，而不是把 `CANCELLED` 当成绝对成功。
+        """
+        if not ids:
+            return []
+        pending = set(str(i) for i in ids)
+        for _ in range(3):
+            if not pending:
+                break
+            time.sleep(0.4)
+            try:
+                self._cancel_pending_limits(symbol)  # 重新撤销残留（普通单 + algo）
+                open_ids = {str(o.get("orderId")) for o in self.client.get_open_orders(symbol)}
+                algo_ids = {str(a.get("algoId")) for a in self.client.get_open_algo_orders(symbol)}
+            except BinanceError:
+                break
+            still = pending & (open_ids | algo_ids)
+            if not still:
+                return []
+            pending = still
+        return sorted(pending)
 
     def _cancel_pending_limits(self, symbol: str) -> list[Any]:
         """撤销该币种全部未成交挂单，返回被撤销的 ID 列表（orderId 或 algoId）。

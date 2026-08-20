@@ -94,6 +94,8 @@ class Config:
         self.watch_enabled = _get_bool("WATCH_ENABLED", True)
         self.watch_check_interval = _get_int("WATCH_CHECK_INTERVAL", 30)  # 秒
         self.watch_max_age_hours = _get_int("WATCH_MAX_AGE_HOURS", 24)  # 小时
+        # 唤醒冷却(秒)：被唤醒后不足此时长无法二次唤醒；多个条件同触时统一在冷却结束后一次唤醒
+        self.watch_wake_cooldown = _get_int("WATCH_WAKE_COOLDOWN", 600)
         # 操作理由列表中「其它类」条目的超时过期时长（小时），防止上下文无限膨胀
         self.thesis_max_age_hours = _get_int("THESIS_MAX_AGE_HOURS", 72)
         # 操作理由列表条目硬上限：超出按「非持仓优先、最旧优先」淘汰，保证上下文有界

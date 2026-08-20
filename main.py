@@ -170,6 +170,8 @@ class TradingSystem:
         self.analyst_state = AnalystStateStore()
         self.symbols = config.symbols
         self._last_reflection: Optional[dict] = None
+        # 本轮被「唤醒条件」提前唤醒时的触发快照（供决策者检查其它条件是否也接近触发）
+        self._wake_snapshot: Optional[list[dict]] = None
         self._web_controller: Optional[WebServerController] = None
         if config.web_enabled:
             from web import WebServerController
@@ -409,12 +411,14 @@ class TradingSystem:
         try:
             experience_context = self.experiences.format_for_context()
             news_ctx_for_decider = self._append_news_timing(news_context, analyst_out)
+            wake_ctx = self._render_wake_context(price_map)
             decision = self.decision_maker.decide(
                 market_report, news_ctx_for_decider, thesis_context, account,
                 experience_context=experience_context,
                 open_orders_by_symbol=open_orders_by_symbol,
                 min_margin_context=min_margin_context,
                 last_round_feedback=self.runtime.last_feedback(),
+                current_watch_context=wake_ctx,
             )
             logger.info(
                 "决策: %d 条指令, %d 条理由操作, 评估=%s",
@@ -1131,13 +1135,18 @@ class TradingSystem:
                 return True
 
     def _check_watch_triggers(self) -> bool:
-        """轮询当前价并核对唤醒条件；任一满足（含量能/时间确认）则清除条件并返回 True。
+        """轮询当前价并核对唤醒条件；满足则统一唤醒一次。
 
-        抗噪声确认（可选，字段见 WakeCondition）：
-        - volume_mult>0：触发时当前 1m K 线成交量 ≥ volume_mult × 前 20 根平均成交量，
-          量化「放量突破」，防止无量漂过阈值也唤醒。
-        - duration_seconds>0：价格需持续停留在阈值外达该时长才唤醒（首次命中记时间戳，
-          之后每次轮询累加），过滤单根 K 线的瞬时刺穿。
+        不再以「量能不足」为由跳过唤醒：价格触达阈值即计入待唤醒，是否放量不再作为门槛
+        （由 duration_seconds 滤除单根 K 线的瞬时刺穿）。
+
+        唤醒冷却：距上次唤醒不足 watch_wake_cooldown（默认 10 分钟）秒时，本次触发的
+        条件只累积不立即唤醒，等冷却结束后与其它已触发条件一次性统一唤醒，避免短时间
+        内因多个条件接连触发而频繁唤醒。
+
+        触发真正唤醒前，把当前全部唤醒条件快照到 self._wake_snapshot（而不是直接丢弃），
+        让被唤醒的这一轮决策者能看到「其它唤醒条件是否也已接近触发」，据此取消或调整，
+        从而在代码冷却之外，从提示词层面进一步避免短时间多次唤醒。
         """
         triggered: list[tuple[dict, float]] = []
         for t in self.watch_store.all():
@@ -1156,27 +1165,7 @@ class TradingSystem:
                     del t["first_hit_at"]
                     self.watch_store.save()
                 continue
-            # 量能确认：当前 1m K 线成交量 ≥ volume_mult × 前 20 根平均成交量
-            vol_mult = float(t.get("volume_mult") or 0)
-            if vol_mult > 0:
-                try:
-                    candles = self.client.get_klines(
-                        t["symbol"], interval="1m", limit=20
-                    )
-                    if len(candles) >= 2:
-                        cur_vol = candles[-1].volume
-                        avg_vol = sum(c.volume for c in candles[:-1]) / max(
-                            len(candles) - 1, 1
-                        )
-                        if cur_vol < vol_mult * avg_vol:
-                            logger.info(
-                                "%s 唤醒条件量能不足（%.4g < %.4g×%.4g），视为噪声不触发",
-                                t["symbol"], cur_vol, vol_mult, avg_vol,
-                            )
-                            continue
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning("检查 %s 唤醒条件量能失败: %s", t["symbol"], exc)
-            # 时间确认：价格需持续停留在阈值外 duration_seconds 秒
+            # 时间确认：价格需持续停留在阈值外 duration_seconds 秒（过滤瞬时刺穿）
             dur = int(t.get("duration_seconds") or 0)
             if dur > 0:
                 now = time.time()
@@ -1188,15 +1177,78 @@ class TradingSystem:
                 if now - float(first) < dur:
                     continue  # 尚未达到要求持续时间，暂不触发
             triggered.append((t, price))
-        if triggered:
-            detail = "; ".join(
-                f"{t['symbol']} {t['condition']}@{t['value']:g}（现价 {price:.6g}）"
-                for t, price in triggered
+        if not triggered:
+            return False
+        # 唤醒冷却：距上次唤醒不足 cooldown 秒则累计条件、暂不唤醒，待冷却后统一触发一次
+        now = time.time()
+        last = getattr(self, "_last_wakeup_at", 0.0)
+        cooldown = float(config.watch_wake_cooldown)
+        if now - last < cooldown:
+            logger.info(
+                "距上次唤醒仅 %.0fs，未到 %ds 冷却期，暂缓唤醒（已累积 %d 个触发待冷却后统一一次唤醒）",
+                now - last, cooldown, len(triggered),
             )
-            logger.warning("唤醒条件触发: %s", detail)
-            self.watch_store.clear_all(reason="条件已触发")
-            return True
-        return False
+            return False
+        self._last_wakeup_at = now
+        self._wake_snapshot = list(self.watch_store.all())
+        detail = "; ".join(
+            f"{t['symbol']} {t['condition']}@{t['value']:g}（现价 {price:.6g}）"
+            for t, price in triggered
+        )
+        logger.warning("唤醒条件触发: %s", detail)
+        self.watch_store.clear_all(reason="条件已触发")
+        return True
+
+    def _render_wake_context(self, price_map: dict[str, float]) -> str:
+        """渲染「被唤醒条件提前唤醒」这一轮的开头要求与当前唤醒条件清单。
+
+        只有当本轮确实是被唤醒条件触发（_wake_snapshot 非空）时才注入,并在渲染后
+        清除快照（一次性）。内容：
+        1. 提示词最前要求：先检查其它唤醒条件是否也已接近触发,有则取消/调整,
+           避免短时间多次唤醒（与代码 10 分钟冷却互为补充）。
+        2. 逐条列出唤醒条件与该币现价,给出距离与触发方向,便于模型判断谁接近、谁再等。
+        """
+        snapshot = getattr(self, "_wake_snapshot", None)
+        if not snapshot:
+            return ""
+        self._wake_snapshot = None  # 一次性消费
+        lines = [
+            "【本轮为唤醒条件触发，请先处理唤醒清单】",
+            "你这次是被下方某个「唤醒条件」（价格触达）而非正常定时循环提前唤醒的。",
+            "系统已强制设定冷却：被唤醒后 10 分钟内无法再次唤醒，多个条件即便同时满足也统一",
+            "在冷却结束后一次性唤醒。请在第一优先位置完成下述动作，再继续正常分析：",
+            "1. 逐一对照下方「当前唤醒条件清单」，判断其中是否还有其它条件也已接近触发"
+            "（现价距离其阈值很近、随时会再次触达）。",
+            "2. 若有，请取消或调整它们（在下方输出的 watch_conditions 中，或删除、或把阈值拉远、"
+            "或合并到同一个价位的触发），避免短期内在冷却结束后又因不同条件接连唤醒；",
+            "只保留真正必要且与当前分析判断一致的唤醒条件。",
+            "3. 若无接近触发的其它条件，维持精简的唤醒条件即可。",
+            "",
+            "当前唤醒条件清单（含现价对比，duration_seconds 为时间确认，满足才触发）：",
+        ]
+        for t in snapshot:
+            sym = t.get("symbol", "?")
+            cond = t.get("condition", "?")
+            val = t.get("value")
+            dur = int(t.get("duration_seconds") or 0)
+            px = price_map.get(sym)
+            px_str = f"{px:.6g}" if px is not None else "?"
+            if px is not None:
+                if val:
+                    diff = px - float(val)
+                    pct = abs(diff / float(val)) * 100
+                    close = "（接近触发！）" if pct < 1.0 else ""
+                    lines.append(
+                        f"- {sym}: {cond}@{val:g}，现价 {px_str}（距阈值 {pct:.2f}%{close}）"
+                        + (f"，需持续 {dur}s" if dur else "")
+                    )
+                else:
+                    lines.append(f"- {sym}: {cond}@{val:g}，现价 {px_str}")
+            else:
+                lines.append(
+                    f"- {sym}: {cond}@{val:g}，现价未知" + (f"，需持续 {dur}s" if dur else "")
+                )
+        return "\n".join(lines)
 
 
 def main() -> None:
