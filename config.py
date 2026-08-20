@@ -74,9 +74,13 @@ class Config:
         self.min_notional = _get_float("MIN_NOTIONAL", 20.0)
         # 单笔开仓所需初始保证金下限（USDT）；名义价值 = 保证金 × 杠杆
         self.min_margin = _get_float("MIN_MARGIN", 2.5)
-        # 单品种止损绝对风险上限（占总权益比例）：(|开仓均价−止损价| × 持仓数量) ≤ 权益×此比例。
-        # 此为代码级硬约束，配合风险额度锁（risk_locks）阻止止损漂移。
-        self.max_sl_risk_ratio = _get_float("MAX_SL_RISK_RATIO", 0.02)
+        # 单品种止损绝对风险参考比例（占总权益）：(|开仓均价−止损价| × 持仓数量)。
+        # 注意：该比例**不再**对止损做权益强算硬拦——止损位置完全由模型按技术位
+        # （支撑/阻力/结构失效处）自主决定，不受账户权益约束。此处仅作为 fit_margin
+        # 缩放仓位的参考预算：模型给出止损距离后，系统按该比例反解预算内最大 margin，
+        # 用于「远止损→自动降档用小仓位」，而非拦截止损本身。
+        # 默认 5%（原 2% 过严，会导致止损被压得紧贴现价、一开仓即被正常波动扫损）。
+        self.max_sl_risk_ratio = _get_float("MAX_SL_RISK_RATIO", 0.05)
         # 全局止损绝对风险总上限（占总权益比例）：所有币种已锁定风险之和 ≤ 权益×此比例。
         # 用于开新单前合计当前全部持仓/挂单风险、检查剩余预算，防止多单挤占风险预算。
         self.max_total_sl_risk_ratio = _get_float("MAX_TOTAL_SL_RISK_RATIO", 0.05)

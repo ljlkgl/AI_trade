@@ -253,7 +253,7 @@ def _render(status: dict[str, Any]) -> str:
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<meta http-equiv="refresh" content="30">
+<meta http-equiv="refresh" content="5">
 <title>交易系统状态 - AI 永续合约</title>
 <style>
   /* ===== Windows 11 Fluent 主题 ===== */
@@ -598,7 +598,7 @@ def _render(status: dict[str, Any]) -> str:
   </div>
   <div class="statusbar">
     <span><span class="pulse"></span>运行中</span>
-    <span><span class="sb-label">自动刷新:</span> 30 秒</span>
+    <span><span class="sb-label">自动刷新:</span> 5 秒</span>
     <span><span class="sb-label">当前时间:</span> {h(_fmt(status.get('now')))}</span>
     <span class="sb-label" style="margin-left:auto">AI 永续合约交易系统 · 状态面板</span>
   </div>

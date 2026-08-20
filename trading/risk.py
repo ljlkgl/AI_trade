@@ -171,25 +171,18 @@ class RiskManager:
         return abs(float(entry) - float(sl)) * float(qty)
 
     def _check_stop_risk(self, errors, symbol, entry, total_qty, proposed_sl, equity):
-        """校验新止损是否违反物理风控铁律，违规则追加 error。
+        """校验新止损，只做「防止损漂移」约束。
 
-        规则1（2% 铁律）：绝对亏损额 ≤ 权益 × max_sl_risk_ratio；
-        规则2（风险额度锁）：若该币种已有初始锁定风险额度 locked_risk，则绝对亏损额只许缩小、
-        不许超过 locked_risk（想扩大止损距离必须减仓）。
+        不再按账户权益比例强算单笔止损：止损位置与仓位由模型按技术位（支撑/阻力）
+        自主决定，系统不因"绝对亏损额 > 权益×比例"而拦单。
+        仅保留：若该币种已有初始锁定风险额度 locked_risk，则绝对亏损额只许缩小、
+        不许超过 locked_risk（想扩大止损距离必须减仓），防止止损漂移扩大风险敞口。
         """
         rk = self._abs_risk(entry, proposed_sl, total_qty)
         if rk <= 0:
             return
-        # 规则1：账户权益比例硬上限（无论是否有锁，都强制）
-        cap = equity * self.max_sl_risk_ratio
-        if rk > cap + 1e-9:
-            errors.append(
-                f"{symbol}: 止损绝对风险 {rk:.4f}U "
-                f"（=|开仓均价{entry:.6g}−新止损{proposed_sl:.6g}|×持仓{total_qty:.6g}) "
-                f"超过账户权益{self.max_sl_risk_ratio:.0%} 上限 {cap:.4f}U"
-            )
-            return
-        # 规则2：风险额度锁（初始基线）—— 绝对亏损只许缩小、不许扩大
+        # （权益强止损已停用）不再按 self.max_sl_risk_ratio 拦截单笔绝对风险。
+        # 规则2：风险额度锁（初始基线），若已锁定则相对该基线防漂移
         locked = self.lock_store.get(symbol) if self.lock_store else None
         if locked:
             locked_u = locked.get("locked_risk_usdt")
