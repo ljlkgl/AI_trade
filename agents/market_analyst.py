@@ -125,9 +125,10 @@ class MarketAnalyst:
         """
         now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         user_parts = [f"当前时间（UTC）：{now_utc}\n\n"]
+        sym_str = ", ".join(sorted(current_prices.keys())) if current_prices else ""
         if market_context and market_context.strip():
             user_parts.append(
-                "以下是 BTC/ETH/SOL 的多周期技术指标与K线数据（布林带/均线/K线结构），"
+                f"以下是 {sym_str or '本账户标的'} 的多周期技术指标与K线数据（布林带/均线/K线结构），"
                 "请基于此输出结构化分析：\n\n"
             )
             user_parts.append(market_context)

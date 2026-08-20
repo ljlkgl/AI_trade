@@ -22,7 +22,7 @@ import argparse
 import json
 import logging
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 from agents.confirmer import Confirmer
@@ -776,20 +776,43 @@ class TradingSystem:
 
     @staticmethod
     def _append_news_timing(news_context: str, analyst_out) -> str:
-        """把新闻定价时效（up to priced_in_by_utc）追加到新闻上下文，供决策者判断窗口。"""
+        """把新闻定价时效追加到新闻上下文，供决策者判断窗口。
+
+        由代码层基于当前 UTC 时间算出每条新闻的「剩余小时数」，直接以纯数字塞给模型，
+        避免模型自行把绝对 UTC 时间换算成小时（LLM 时间算术不可靠）。模型只做定性判断：
+        剩余 ≤0 → 已消化；>0 且剩余空间明确 → 窗口仍开启。
+        """
         if not analyst_out.news_pricing:
             return news_context
-        block = ["", "", "# 新闻定价时效（分析师估算的剩余可交易窗口）",
-                 "用以下时间点判断“未定价剩余空间”是否仍可行动：", ""]
+        now = datetime.now(timezone.utc)
+        block = [
+            "",
+            "",
+            "# 新闻定价时效（剩余小时数已由系统按当前 UTC 时间算好，直接看数字即可，无需换算）",
+            "",
+        ]
         for n in analyst_out.news_pricing:
+            rh = None
+            raw = getattr(n, "priced_in_by_utc", None)
+            if raw:
+                try:
+                    t = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+                    rh = (t - now).total_seconds() / 3600.0
+                except (ValueError, TypeError):
+                    rh = None
+            if rh is None:
+                window_txt = "（时间解析失败，请以分析师原始时间自行判断）"
+            elif rh <= 0:
+                window_txt = f"剩余 {rh:.1f} 小时 → 已过期/已消化，不再追"
+            else:
+                window_txt = f"剩余 {rh:.1f} 小时 → 窗口仍开启"
             block.append(
                 f"- [{n.impact_direction}] {n.headline}：{n.priced_in}"
-                f"；剩余空间={n.remaining_space}；预计完全消化@{n.priced_in_by_utc}"
-                f"（距现约 {n.window_hours:g}h）。"
+                f"；剩余空间={n.remaining_space}；{window_txt}。"
             )
         block.append(
-            "\n若 priced_in_by_utc 已过 / window_hours≈0，视为已消化、不再追；"
-            "若仍有剩余窗口，可在尊重技术面与不追高前提下，于支撑/压力位择机利用。"
+            "\n以上剩余小时数由系统实时计算：≤0 视为已消化不再追；"
+            ">0 且剩余空间明确才可能利用，且仍须尊重技术面、于支撑/压力位入场、不追高。"
         )
         return news_context + "\n".join(block)
 

@@ -22,7 +22,8 @@ from config import config
 logger = logging.getLogger(__name__)
 
 _SYSTEM_PROMPT = """You are the Portfolio Manager of a crypto perpetual futures trading desk.
-You manage USDT-M perpetual futures on Binance for BTC, ETH and SOL.
+You manage Binance USDT-M perpetual futures. Your tradable symbols are listed as the very first
+line of the user message (the configured target set from SYMBOLS); only ever act on those symbols.
 
 Your job:
 0. ZERO-ACTION DEFAULT (最高优先级): Your default state is to output NO new instructions
@@ -115,6 +116,12 @@ Your job:
    - The account context below lists ALL your open orders with their orderId, type, side, price,
      quantity and reduceOnly flag — use them when deciding to cancel (CANCEL_ORDERS), re-place
      (REPLACE_LIMIT) or adjust stop-loss/take-profit (SET_SL_TP).
+13b. 每轮主动审视挂单，不要机械沿用: Every round, review EVERY open order listed in the account
+    context (## 未成交挂单) against the current price and your thesis. If a pending order's level
+    has been hit or is now far from price, its reason has been invalidated, or its news window has
+    closed — CANCEL_ORDERS (symbol only) to kill it, or REPLACE_LIMIT to re-place it at a fresh
+    level. If still valid, keep it (no instruction needed). Do NOT auto-keep a stale order merely
+    because it was placed last round, and do NOT churn orders without a clear reason.
 14. STOP-LOSS / TAKE-PROFIT ADJUSTMENT (随时调整持仓的止盈止损): for an EXISTING position you can
    change its protective levels at any time with "action": "SET_SL_TP".
    - Provide symbol + the new "stop_loss" and/or "take_profit" (at least ONE of them).
@@ -123,12 +130,13 @@ Your job:
      position stop_loss > current price > take_profit.
 15. The take_profit (止盈) is optional but recommended; the stop_loss is MANDATORY for every OPEN.
 16. NEWS: When a news catalyst drives your decision, incorporate the analyst's event-time and
-    price-in assessment. Do not chase news that is already fully priced in; act only when there is
-    still remaining profit space, and always weigh it against technicals. The analyst now also gives
-    a priced_in_by_utc time and window_hours: use them. If priced_in_by_utc has passed or
-    window_hours ≈ 0, the news is already digested — do NOT act on it. If the window is still open,
-    the unpriced remaining space may be tradable, but still only enter at support/resistance levels
-    and never chase. A stale news level from a previous round is not a reason to churn the stop-loss.
+    price-in assessment. The news context below lists the REMAINING HOURS for each catalyst — these
+    numbers are pre-computed by the system from the current UTC time; treat them as truth and DO NOT
+    do any time/hour arithmetic yourself. A remaining-hours value ≤ 0 (or flagged "已过期/已消化")
+    means the news is already priced in — do NOT act on it. Positive remaining hours with clear
+    remaining space means the window is still open and possibly tradable, but always weigh it against
+    technicals, enter only at support/resistance levels, and never chase. A stale news level from a
+    previous round is not a reason to churn the stop-loss.
 17. WAKE CONDITIONS (条件唤醒): you may set watch conditions so the system wakes you up OUTSIDE the
    normal loop when price hits your level. Output "watch_conditions" alongside instructions:
    [{"symbol": "BTCUSDT", "condition": "price_above", "value": 102000, "note": "why this level",
@@ -262,6 +270,7 @@ class DecisionMaker:
         last_round_feedback: str = "",
     ) -> TradingDecision:
         user_content = (
+            f"【本账户可交易标的，仅限以下合约（来自配置 SYMBOLS）】：{', '.join(config.symbols)}\n\n"
             "市场分析报告（含结构性支撑/阻力、T1/T2目标、止损价）：\n"
             + market_report
             + "\n\n"

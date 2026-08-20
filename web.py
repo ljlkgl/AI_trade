@@ -253,7 +253,6 @@ def _render(status: dict[str, Any]) -> str:
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<meta http-equiv="refresh" content="5">
 <title>交易系统状态 - AI 永续合约</title>
 <style>
   /* ===== Windows 11 Fluent 主题 ===== */
@@ -598,11 +597,34 @@ def _render(status: dict[str, Any]) -> str:
   </div>
   <div class="statusbar">
     <span><span class="pulse"></span>运行中</span>
-    <span><span class="sb-label">自动刷新:</span> 5 秒</span>
-    <span><span class="sb-label">当前时间:</span> {h(_fmt(status.get('now')))}</span>
+    <span><span class="sb-label">局部刷新:</span> 8 秒</span>
+    <span id="refreshTs" class="sb-label">当前时间: {h(_fmt(status.get('now')))}</span>
     <span class="sb-label" style="margin-left:auto">AI 永续合约交易系统 · 状态面板</span>
   </div>
 </div>
+<script>
+(function(){{
+  var MS = 8000;
+  var params = new URLSearchParams(location.search);
+  var pw = params.get("password") || "";
+  var main = document.querySelector("main.main");
+  var ts = document.getElementById("refreshTs");
+  function refresh(){{
+    var sc = main ? main.scrollTop : (window.scrollY || 0);
+    fetch(location.pathname + "?password=" + encodeURIComponent(pw), {{cache:"no-store"}})
+      .then(function(r){{ if(!r.ok) throw new Error(r.status); return r.text(); }})
+      .then(function(html){{
+        var doc = new DOMParser().parseFromString(html, "text/html");
+        var nm = doc.querySelector("main.main");
+        if (nm && main) {{ main.innerHTML = nm.innerHTML; main.scrollTop = sc; }}
+        var nt = doc.getElementById("refreshTs");
+        if (nt && ts) ts.textContent = nt.textContent;
+      }})
+      .catch(function(){{ /* 瞬时/网络错误静默，下轮重试 */ }});
+  }}
+  setInterval(refresh, MS);
+}})();
+</script>
 </body></html>""")
     return "\n".join(rows)
 
