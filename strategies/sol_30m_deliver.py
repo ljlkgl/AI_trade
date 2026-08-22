@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -211,11 +212,18 @@ class Sol30mStrategy:
         candles = fetch_30m_klines(self.client, self.symbol)
         if len(candles) < 100:
             raise RuntimeError(f"SOL 30m K线数据不足（{len(candles)} 根）")
-        close = np.asarray([c.close for c in candles], dtype=float)
+        # 关键口径：丢弃「尚未收盘」的最新一根 K 线（其 close 是实时变动的未完成价，
+        # 且它本身就是本轮刚开盘的新 K 线），保证信号只基于「已收盘」的 30m K 线。
+        # 这样每根 K 线收盘后计算一次，close[-1] 落在刚收盘的那根上，与回测口径一致。
+        now_ms = int(time.time() * 1000)
+        closed = [c for c in candles if c.close_time <= now_ms]
+        if not closed:
+            raise RuntimeError("SOL 30m 无已收盘 K 线")
+        close = np.asarray([c.close for c in closed], dtype=float)
         info = compute_target(close, self.params)
         info["price"] = float(close[-1])
-        info["bars"] = len(candles)
-        info["last_open_time"] = candles[-1].open_time
+        info["bars"] = len(closed)
+        info["last_open_time"] = closed[-1].open_time
         return info
 
     def decide(

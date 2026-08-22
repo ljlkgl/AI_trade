@@ -46,7 +46,7 @@ from trading.risk import RiskManager, build_min_margin_context
 from trading.risk_lock import RiskLockStore
 from trading.rounds import RoundLog, RuntimeState
 from trading.watch import WatchStore
-from strategies.sol_30m_deliver import Sol30mStrategy
+from strategies.sol_30m_deliver import INTERVAL, SOL_SYMBOL, Sol30mStrategy
 
 logging.basicConfig(
     level=logging.INFO,
@@ -1145,7 +1145,20 @@ class TradingSystem:
                 logger.info("操作理由列表自动清理 %d 条过期条目", removed)
 
     def run_loop(self) -> None:
-        """循环模式：每 interval 分钟执行一轮；若模型设定唤醒条件，条件满足时提前执行。"""
+        """循环模式：AI 决策按固定间隔 + 条件唤醒；SOL 规则策略按 30m K 线收盘节奏。
+
+        web 端 /set_strategy 可运行中切换：循环每轮重新读取策略，切换后自动采用
+        对应的等待节奏——规则策略 = 每根 30m K 线收盘后计算一次（与回测口径一致，
+        取消原来的固定间隔与条件唤醒等待模式）。
+        """
+        while True:
+            if _read_strategy() == "sol_30m_deliver":
+                self._run_sol_rule_loop()
+            else:
+                self._run_ai_loop()
+
+    def _run_ai_loop(self) -> None:
+        """AI 决策循环：每 interval 分钟执行一轮；模型设定唤醒条件时满足则提前执行。"""
         logger.info(
             "启动循环模式，间隔 %d 分钟（测试网=%s DRY_RUN=%s 条件唤醒=%s）",
             self.interval_minutes, config.binance_testnet, config.dry_run,
@@ -1153,7 +1166,7 @@ class TradingSystem:
         )
         # 程序恢复：若上一轮分析时间未到下一轮间隔，则接上等待（仅启动时执行一次）
         self._resume_wait_if_needed()
-        while True:
+        while _read_strategy() != "sol_30m_deliver":
             started = time.time()
             try:
                 result = self.run_once()
@@ -1173,6 +1186,58 @@ class TradingSystem:
             else:
                 logger.info("下一轮将在 %.0f 秒后进行", sleep_sec)
                 time.sleep(sleep_sec)
+
+    def _run_sol_rule_loop(self) -> None:
+        """SOL 30m 规则策略循环：每根 30m K 线收盘后计算一次。
+
+        取消 AI 路径的固定间隔等待与条件唤醒；与回测口径一致，每根已收盘 K 线
+        对应一次决策，信号只依赖已收盘历史——不在 K 线中途计算（避免把尚未收盘的
+        最新一根当作收盘价）。程序启动或上一轮结束后，都先等到最新一根 30m K 线
+        收盘（含少量缓冲）再计算。
+        """
+        logger.info(
+            "启动 SOL_30m 规则策略循环：每根 %s K 线收盘后计算一次"
+            "（测试网=%s DRY_RUN=%s；取消固定间隔与条件唤醒等待）",
+            INTERVAL, config.binance_testnet, config.dry_run,
+        )
+        while _read_strategy() == "sol_30m_deliver":
+            wait_sec = self._sol_wait_seconds_until_next_close()
+            logger.info("等待 %.0f 秒至本根 %s K 线收盘后进行决策", wait_sec, INTERVAL)
+            time.sleep(wait_sec)
+            started = time.time()
+            try:
+                result = self.run_once()
+                try:
+                    self.round_log.append(result)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("记录轮次历史失败: %s", exc)
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("循环中出现未处理异常: %s", exc)
+
+    def _sol_wait_seconds_until_next_close(self, buffer_sec: float = 3.0) -> float:
+        """返回距下一根 30m K 线收盘（含缓冲）的等待秒数。
+
+        以交易所最新一根 30m K 线的 open_time 推算（避免本地时钟与交易所时钟偏差）：
+        最新 K 线正在成型，其收盘时刻 = open_time + 30 分钟。等待结束后恰有新 K 线
+        开盘（旧 K 线收盘 = 新 K 线开盘，是同一时刻）；策略侧已丢弃未收盘的新 K 线，
+        只用刚收盘的那根计算，因此这里只负责把计算时刻对齐到「最新 K 线收盘」。
+        收盘后再等 buffer 秒，确保该 K 线 close 已最终化。
+        """
+        interval_ms = 30 * 60 * 1000
+        now_ms = int(time.time() * 1000)
+        try:
+            candles = self.client.get_klines(SOL_SYMBOL, INTERVAL, limit=1)
+            if not candles:
+                raise ValueError("无 K 线")
+            open_ms = candles[0].open_time
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "获取 %s %s K 线失败，按本地 30m 边界对齐: %s",
+                SOL_SYMBOL, INTERVAL, exc,
+            )
+            open_ms = (now_ms // interval_ms) * interval_ms
+        next_close_ms = open_ms + interval_ms + int(buffer_sec * 1000)
+        return max((next_close_ms - now_ms) / 1000.0, 1.0)
 
     def _resume_wait_if_needed(self) -> None:
         """程序关闭再开启后的恢复：接上上一轮的等待节奏。
