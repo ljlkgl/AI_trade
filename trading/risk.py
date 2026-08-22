@@ -219,6 +219,7 @@ class RiskManager:
         account: AccountInfo,
         symbol_info: SymbolInfo,
         mark_price: float,
+        symbol_min_notional: Optional[float] = None,
     ) -> RiskCheckResult:
         """校验单条指令，返回结果。"""
         errors: list[str] = []
@@ -281,8 +282,12 @@ class RiskManager:
                 )
             else:
                 notional = margin * lev
-                # 名义价值下限 = 系统下限 与 交易所 MIN_NOTIONAL 的较大值（二者都需满足）
+                # 名义价值下限：默认取「系统下限 与 交易所 MIN_NOTIONAL 的较大值」。
+                # 若调用方传入 symbol_min_notional（如 SOL 规则策略放宽为 5.83/1x），
+                # 则按该单币种下限覆盖（AI 路径不传，仍按交易所口径）。
                 min_notional = max(self.min_notional, symbol_info.min_notional)
+                if symbol_min_notional is not None:
+                    min_notional = symbol_min_notional
                 # 实际可成交名义 = 按交易所 step 取整后的数量 × 开仓价（与 OrderExecutor._quantity
                 # 同口径）。高价币种（如 BTC≈7 万）即便取整到最小 0.001 也已远超 min_notional，
                 # 若用「目标名义=保证金×杠杆」会低于实际可成交值，误杀本可有效成交的订单。
@@ -300,10 +305,17 @@ class RiskManager:
                         f"（含交易所 MIN_NOTIONAL {symbol_info.min_notional:.2f}；"
                         f"名义=取整后数量×开仓价）"
                     )
-                if margin < self.min_margin:
+                # 最小保证金下限：默认系统下限 self.min_margin。
+                # 若调用方传入 symbol_min_notional（如 SOL 规则策略放宽为 5.83/1x），
+                # 则按「当前杠杆下的最小保证金」= symbol_min_notional / 杠杆 口径执行
+                #（与用户确认：SOL 1x 最小保证金 5.83，杠杆 N 时最小保证金 = 5.83/N）。
+                _min_margin_eff = self.min_margin
+                if symbol_min_notional is not None and lev > 0:
+                    _min_margin_eff = symbol_min_notional / lev
+                if margin < _min_margin_eff:
                     errors.append(
                         f"{instruction.symbol}: 开仓保证金 {margin:.4f} USDT "
-                        f"低于最小保证金 {self.min_margin:.2f} USDT"
+                        f"低于最小保证金 {_min_margin_eff:.2f} USDT"
                     )
                 # 可用余额校验：初始保证金不得超过账户可用余额（真实可成交性底线）
                 if margin > account.available_balance:
@@ -435,6 +447,7 @@ class RiskManager:
         price_map: dict[str, float],
         symbol_info_map: dict[str, SymbolInfo],
         auto_downgrade: bool = True,
+        symbol_min_notional: Optional[dict[str, float]] = None,
     ) -> tuple[list[TradeInstruction], list[RiskCheckResult]]:
         """校验整个决策。返回 (通过的指令, 校验结果列表)。
 
@@ -454,10 +467,14 @@ class RiskManager:
             initial.append(ins)
 
         passed: list[TradeInstruction] = []
+        _symbol_floor = symbol_min_notional or {}
         for ins in initial:
             mark = price_map.get(ins.symbol, 0.0)
             info = symbol_info_map.get(ins.symbol)
-            res = self.validate_instruction(ins, account, info, mark)
+            res = self.validate_instruction(
+                ins, account, info, mark,
+                symbol_min_notional=_symbol_floor.get(ins.symbol),
+            )
             if res.ok:
                 passed.append(ins)
                 results.append(res)
@@ -467,7 +484,10 @@ class RiskManager:
                 fit = self.fit_margin_to_budget(ins, account, info, mark)
                 if fit is not None and ins.margin is not None and fit < ins.margin:
                     fitted = ins.model_copy(update={"margin": fit})
-                    res2 = self.validate_instruction(fitted, account, info, mark)
+                    res2 = self.validate_instruction(
+                        fitted, account, info, mark,
+                        symbol_min_notional=_symbol_floor.get(ins.symbol),
+                    )
                     if res2.ok:
                         logger.info(
                             "%s %s 止损绝对风险超限，自动降档 margin %.6g→%.6g 重提成功",

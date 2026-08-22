@@ -82,6 +82,10 @@ class Config:
         self.min_notional = _get_float("MIN_NOTIONAL", 20.0)
         # 单笔开仓所需初始保证金下限（USDT）；名义价值 = 保证金 × 杠杆
         self.min_margin = _get_float("MIN_MARGIN", 2.5)
+        # SOL_30m_deliver 策略的 SOLUSDT 最小名义下限（USDT）：
+        # 交易所 MIN_NOTIONAL=50 对小账户过严；按客户端观察（1x 最小保证金 5.83）放宽，
+        # 仅 SOL 规则策略开仓时生效（风控按此值校验），AI 路径仍用交易所口径。
+        self.sol_min_notional = _get_float("SOL_MIN_NOTIONAL", 5.83)
         # 单品种止损绝对风险参考比例（占总权益）：(|开仓均价−止损价| × 持仓数量)。
         # 注意：该比例**不再**对止损做权益强算硬拦——止损位置完全由模型按技术位
         # （支撑/阻力/结构失效处）自主决定，不受账户权益约束。此处仅作为 fit_margin

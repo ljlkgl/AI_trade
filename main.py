@@ -535,8 +535,11 @@ class TradingSystem:
                 logger.warning("更新唤醒条件失败: %s", exc)
 
         # 8. 风控校验（价格/精度已在第 2 步获取，此处复用）
+        #    SOL 规则策略放宽 SOLUSDT 最小名义（config.sol_min_notional，默认 5.83/1x），
+        #    AI 路径不传覆盖，仍按交易所 MIN_NOTIONAL 口径。
         passed, risk_results = self.risk.validate_decision(
-            decision.instructions, account, price_map, symbol_info_map
+            decision.instructions, account, price_map, symbol_info_map,
+            symbol_min_notional=({"SOLUSDT": config.sol_min_notional} if use_rule else None),
         )
         # 指令执行顺序（确定性拆分）：同一币种先平仓/减仓(CLOSE/FLATTEN)，再调整
         # 止盈止损(SET_SL_TP)——SET_SL_TP 无数量参数、作用于当前全部持仓，只有先

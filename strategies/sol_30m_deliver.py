@@ -24,6 +24,7 @@ import numpy as np
 import pandas as pd
 
 from agents.schemas import OrderAction, OrderType, TradeInstruction, TradingDecision
+from config import config
 from trading.types import AccountInfo, Candle
 
 logger = logging.getLogger(__name__)
@@ -288,6 +289,10 @@ class Sol30mStrategy:
             target_notional = abs(target) * equity
             max_margin = max(0.0, account.available_balance) * MARGIN_SAFETY
             margin = min(target_notional / lev, max_margin)
+            # 保证金下限 = 当前杠杆下的最小保证金（SOL 最小名义按确认放宽为 5.83/1x），
+            # 保证下单名义至少满足交易所最小可成交要求，避免被风控按最小名义拦截。
+            min_margin_lev = config.sol_min_notional / lev
+            margin = max(margin, min_margin_lev)
             if cur_qty <= 0:
                 action = OrderAction.OPEN_LONG if target > 0 else OrderAction.OPEN_SHORT
                 instructions.append(_open(action, margin))
