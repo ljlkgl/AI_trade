@@ -34,9 +34,9 @@ logger = logging.getLogger(__name__)
 DEFAULT_PARAMS = {
     "train_months": 24,
     "max_leverage": 5.0,
-    "vol_target": 0.10,
+    "vol_target": 0.15,
     "vol_window": 20,
-    "smooth_alpha": 0.40,
+    "smooth_alpha": 0.50,
     "bars_per_day": 48,
 }
 
@@ -152,6 +152,9 @@ def compute_target(close: np.ndarray, params: dict) -> dict:
             j += 1
         i = j
     pos = _smooth(pos, params["smooth_alpha"])
+    # 与更新后的回测同口径：EMA 平滑后再就近取整到整数杠杆档 {0,±1,...,±max_leverage}，
+    # 满足真实交易杠杆必须为整数的约束，且从不超过 max_leverage。
+    pos = np.clip(np.round(pos), -params["max_leverage"], params["max_leverage"])
 
     v_now = vol[-1]
     return {
@@ -239,8 +242,11 @@ class Sol30mStrategy:
         target = sig["target_pos"]
         bars = sig["bars"]
         vol_a = sig["vol_annual"]
-        # 杠杆：按回测配置 max_leverage 执行（保证金=目标名义/杠杆），与回测权益倍数口径一致
+        # 交易所杠杆：按回测配置 max_leverage 作为上限/保证金换算倍率（交易所只接受整数）。
+        # 但「有效杠杆」= 名义价值/权益 = |目标仓位|，随波动率变化（回测均值约 0.8x），
+        # 并非恒为 max_leverage；max_leverage 只是持仓规模上限。
         lev = max(1, int(self.params["max_leverage"]))
+        eff_lev = abs(target)
 
         # 当前 SOL 持仓
         pos = next((p for p in account.positions if p.symbol == self.symbol), None)
@@ -273,7 +279,7 @@ class Sol30mStrategy:
                 reason=(
                     f"SOL_30m 趋势策略：目标仓位 {target:+.3f}（{side}头，权益倍数）"
                     f"，动量尺度 k={sig['best_k']}，年化波动率 {vol_a:.2f}"
-                    f"，止损 {stop_pct * 100:.1f}%（{sl:.4f}），杠杆 {lev}x"
+                    f"，止损 {stop_pct * 100:.1f}%（{sl:.4f}），有效杠杆 {eff_lev:.2f}x"
                 ),
             )
 
@@ -304,7 +310,7 @@ class Sol30mStrategy:
             if cur_qty <= 0:
                 action = OrderAction.OPEN_LONG if target > 0 else OrderAction.OPEN_SHORT
                 instructions.append(_open(action, margin))
-                notes.append(f"信号 {target_side} → 开仓 {margin:.2f}U @{lev}x（目标名义 {target_notional:.2f}U）")
+                notes.append(f"信号 {target_side} → 开仓 {margin:.2f}U（有效杠杆 {eff_lev:.2f}x，目标名义 {target_notional:.2f}U）")
             elif cur_side != target_side:
                 # 方向翻转 → 先平后开（风控拆分保证平仓先执行）
                 instructions.append(TradeInstruction(
@@ -316,7 +322,7 @@ class Sol30mStrategy:
                 ))
                 action = OrderAction.OPEN_LONG if target > 0 else OrderAction.OPEN_SHORT
                 instructions.append(_open(action, margin))
-                notes.append(f"方向翻转 {cur_side}→{target_side} → 平旧开新（{margin:.2f}U @{lev}x）")
+                notes.append(f"方向翻转 {cur_side}→{target_side} → 平旧开新（{margin:.2f}U，有效杠杆 {eff_lev:.2f}x）")
             else:
                 notes.append(f"信号 {target_side}，与现有持仓一致，HOLD")
 
@@ -327,7 +333,8 @@ class Sol30mStrategy:
             f" {'；'.join(notes) or '无操作'}"
         )
         risk_notes = (
-            f"规则策略：SOL 按回测配置 {lev}x 杠杆执行（保证金=目标名义/杠杆，且不超过可用余额"
+            f"规则策略：SOL 有效杠杆=目标仓位（权益倍数，随波动率变化，非恒为 {lev}x；"
+            f"交易所杠杆按 max_leverage={lev}x 设置，保证金=目标名义/杠杆，且不超过可用余额"
             f"的 {MARGIN_SAFETY * 100:.0f}%），止损按 {STOP_VOL_MULT}×日波动率折算"
             f"（{stop_pct * 100:.1f}%）自动设置；不调用 LLM、不设条件唤醒；"
             f"同方向持有、信号翻转先平后开。数据根数 {bars}。"

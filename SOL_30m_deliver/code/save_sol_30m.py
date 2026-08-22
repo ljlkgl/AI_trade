@@ -18,11 +18,11 @@ from scripts.trend_strategy import run
 ROOT=os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CSV=os.path.join(ROOT,'data','SOLUSDT_30m_kline.csv')
 BPD=48; PPY=365*BPD
-CONF=dict(train_months=24, max_leverage=5.0, vol_target=0.10, smooth_alpha=0.40)
+CONF=dict(train_months=24, max_leverage=5.0, vol_target=0.15, smooth_alpha=0.50)
 VROOT=os.path.join(ROOT,'versions','SOL_30m','v1_robust')
 os.makedirs(VROOT,exist_ok=True)
 
-m=run(csv=CSV,bars_per_day=BPD,**CONF,report=True)
+m=run(csv=CSV,bars_per_day=BPD,quantize=True,**CONF,report=True)
 
 metrics={k:round(float(m[k]),4) for k in
          ['annual_return','annual_volatility','sharpe','max_drawdown','seg_std','autocorr','lin_r2','mean_leverage']}

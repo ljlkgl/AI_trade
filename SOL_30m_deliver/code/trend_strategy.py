@@ -219,9 +219,11 @@ def smooth(pos, alpha=0.25, max_step=None):
 
 def run(csv, train_months=24, max_leverage=2.0, vol_target=0.25, vol_window=20,
         smooth_alpha=0.25, max_step=None, out_png=None, report=True,
-        bars_per_day=1):
+        bars_per_day=1, quantize=False):
     """趋势跟踪（v1）。bars_per_day: 每根K线对应多少自然日(日线=1, 30m=48)，
-    用于把以"天"为单位的窗口/动量尺度换算为根(bars)，保证跨频率口径一致。"""
+    用于把以"天"为单位的窗口/动量尺度换算为根(bars)，保证跨频率口径一致。
+    quantize=True 时把连续仓位就近取整到整数杠杆档 {0,±1,...,±max_leverage}，
+    满足真实交易杠杆必须为整数的约束。"""
     idx, close = load_ts(csv)
     n = len(close)
     bpd = bars_per_day
@@ -246,6 +248,9 @@ def run(csv, train_months=24, max_leverage=2.0, vol_target=0.25, vol_window=20,
         i = j
 
     pos = smooth(pos, smooth_alpha, max_step=max_step)
+    if quantize:
+        # 就近取整到整数杠杆 → 真实可执行仓位，且从不超过 max_leverage
+        pos = np.clip(np.round(pos), -max_leverage, max_leverage)
     r, net, eq, cost = backtest_positions(pos, close)
     m = metrics(eq, ppy=ppy)
     m['mean_leverage'] = float(np.mean(np.abs(pos)))
@@ -352,6 +357,8 @@ def main():
     ap.add_argument("--target-annual", type=float, default=0.40)
     ap.add_argument("--bars-per-day", type=float, default=1.0,
                     help="每根K线对应多少自然日(日线=1, 30m=48)")
+    ap.add_argument("--quantize", action="store_true",
+                    help="把连续仓位就近取整到整数杠杆档")
     ap.add_argument("--out", default=None)
     ap.add_argument("--scan", action="store_true")
     ap.add_argument("--flat", action="store_true")
@@ -372,7 +379,7 @@ def main():
         run(csv=args.csv, train_months=args.train_months, max_leverage=args.max_leverage,
             vol_target=args.vol_target, vol_window=args.vol_window,
             smooth_alpha=args.smooth_alpha, max_step=args.max_step, out_png=args.out,
-            bars_per_day=args.bars_per_day)
+            bars_per_day=args.bars_per_day, quantize=args.quantize)
 
 
 if __name__ == "__main__":
