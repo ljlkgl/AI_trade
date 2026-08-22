@@ -1,0 +1,9 @@
+{
+  "train_months": 24,
+  "max_leverage": 5.0,
+  "vol_target": 0.1,
+  "smooth_alpha": 0.4,
+  "bars_per_day": 48,
+  "fee_rate": 0.0004,
+  "slip_rate": 0.0001
+}

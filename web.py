@@ -87,6 +87,28 @@ def _read_json(name: str) -> Any:
         return []
 
 
+def _read_strategy() -> str:
+    """读取当前决策引擎（ai / sol_30m_deliver）。
+
+    main.py 每轮读取同一文件；此处供面板展示当前策略，缺失/非法时回退到 config.strategy。
+    """
+    mode = ""
+    try:
+        with open(_STATE_DIR / "strategy.json", "r", encoding="utf-8") as f:
+            mode = str(json.load(f).get("strategy", "")).strip().lower()
+    except Exception:  # noqa: BLE001
+        pass
+    if mode not in ("ai", "sol_30m_deliver"):
+        mode = config.strategy if config.strategy in ("ai", "sol_30m_deliver") else "ai"
+    return mode
+
+
+_STRATEGY_LABELS = {
+    "ai": "AI 多智能体决策",
+    "sol_30m_deliver": "SOL 30m 递送趋势策略",
+}
+
+
 def _merge_open_orders(symbol: str, client: BinanceClient) -> list[dict]:
     """合并某币种普通订单与算法条件单（止盈止损），统一为普通订单字段形状。"""
     orders: list[dict] = []
@@ -138,6 +160,7 @@ class StatusCollector:
             "testnet": config.binance_testnet,
             "dry_run": config.dry_run,
             "symbols": config.symbols,
+            "strategy": _read_strategy(),
             "live": False,  # 实时账户是否拉取成功
         }
         live = self.client
@@ -340,6 +363,17 @@ def _render(status: dict[str, Any]) -> str:
   .tag {{ display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 12px; }}
   .tag.long {{ background: #dff5e3; color: #0a7a2f; }} .tag.short {{ background: #fde2de; color: #c42b1c; }}
   .tag.algo {{ background: #fff3cf; color: #8a5a00; }}
+  .strat-row {{ display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }}
+  .strat-btn {{
+    padding: 6px 14px; border: 1px solid #d1d1d1; border-radius: 6px;
+    background: #ffffff; color: #333; font-size: 13px; cursor: pointer;
+    font-family: inherit; transition: all .12s;
+  }}
+  .strat-btn:hover {{ border-color: #0078d4; color: #0078d4; background: #f0f7fe; }}
+  .strat-btn.active {{
+    background: #0078d4; border-color: #0078d4; color: #fff; font-weight: 600;
+  }}
+  .strat-hint {{ color: #7a7a7a; font-size: 12px; }}
   .muted {{ color: #7a7a7a; font-size: 12px; }}
   .wrap {{ word-break: break-all; white-space: pre-wrap; }}
   .child {{ padding-left: 22px !important; color: #555; }}
@@ -416,6 +450,7 @@ def _render(status: dict[str, Any]) -> str:
     <div class="nav-head">行情</div>
     <a href="#prices">当前价格</a>
     <div class="nav-head">策略</div>
+    <a href="#strategy">决策引擎</a>
     <a href="#theses">操作理由<span class="cnt">{len(status.get('theses') or [])}</span></a>
     <a href="#watch">唤醒条件<span class="cnt">{len(status.get('watch') or [])}</span></a>
     <div class="nav-head">日志</div>
@@ -424,6 +459,18 @@ def _render(status: dict[str, Any]) -> str:
   <main class="main">
   <div class="grid">
   {' <span class="muted">' + h(status['note']) + '</span>' if status.get('note') else ''}""")
+
+    # ---- 决策引擎切换 ----
+    cur_strategy = status.get("strategy") or "ai"
+    cur_label = _STRATEGY_LABELS.get(cur_strategy, cur_strategy)
+    rows.append(f"""<section id="strategy" class="card"><div class="c-head"><span class="c-bar"></span><h2>决策引擎</h2></div><div class="c-body">
+<div class="strat-row">
+  <button class="strat-btn{' active' if cur_strategy == 'ai' else ''}" data-strat="ai">AI 多智能体决策</button>
+  <button class="strat-btn{' active' if cur_strategy == 'sol_30m_deliver' else ''}" data-strat="sol_30m_deliver">SOL 30m 递送策略</button>
+  <span class="strat-hint">当前: {h(cur_label)} · 切换后下一轮决策立即生效，无需重启</span>
+</div>
+<p class="muted" style="margin:8px 0 0">AI 决策 = 多智能体 LLM 分析/决策/确认/复盘；SOL 30m 递送 = 纯规则趋势跟踪，仅操作 SOLUSDT，不调用 LLM。</p>
+</div></section>""")
 
     # ---- 账户概况 ----
     acc = status.get("account") or {}
@@ -661,6 +708,24 @@ def _render(status: dict[str, Any]) -> str:
       .catch(function(){{ /* 瞬时/网络错误静默，下轮重试 */ }});
   }}
   setInterval(refresh, MS);
+
+  // 决策引擎切换：写入 state/strategy.json，成功后整页刷新。
+  // 事件委托到 document（自动刷新会替换 main 内 HTML，需避免监听器丢失）。
+  document.addEventListener("click", function(ev){{
+    var btn = ev.target && ev.target.closest ? ev.target.closest(".strat-btn") : null;
+    if (!btn) return;
+    if (btn.classList.contains("active")) return;
+    var strat = btn.getAttribute("data-strat");
+    btn.disabled = true;
+    fetch("/set_strategy?strategy=" + encodeURIComponent(strat)
+          + "&password=" + encodeURIComponent(pw), {{cache:"no-store"}})
+      .then(function(r){{ if(!r.ok) throw new Error(r.status); return r.json(); }})
+      .then(function(j){{
+        if (j && j.ok) {{ location.reload(); }}
+        else {{ btn.disabled = false; alert((j && j.error) ? j.error : "切换失败"); }}
+      }})
+      .catch(function(){{ btn.disabled = false; alert("切换请求失败"); }});
+  }});
 }})();
 </script>
 </body></html>""")
@@ -703,6 +768,24 @@ class Handler(BaseHTTPRequestHandler):
                 return
             body = json.dumps(status, ensure_ascii=False, default=str).encode("utf-8")
             self._send(200, "application/json", body)
+        elif path == "/set_strategy":
+            strat = parse_qs(parsed.query).get("strategy", [""])[0].strip().lower()
+            if strat not in ("ai", "sol_30m_deliver"):
+                self._send(400, "application/json", json.dumps(
+                    {"error": f"非法策略: {strat}（可选 ai / sol_30m_deliver）"},
+                    ensure_ascii=False).encode("utf-8"))
+                return
+            try:
+                _STATE_DIR.mkdir(parents=True, exist_ok=True)
+                (_STATE_DIR / "strategy.json").write_text(
+                    json.dumps({"strategy": strat}), encoding="utf-8")
+                logger.info("决策引擎切换为: %s", strat)
+                body = json.dumps({"ok": True, "strategy": strat},
+                                  ensure_ascii=False).encode("utf-8")
+                self._send(200, "application/json", body)
+            except OSError as exc:
+                self._send(500, "application/json", json.dumps(
+                    {"error": str(exc)}, ensure_ascii=False).encode("utf-8"))
         else:
             self._send(404, "text/plain; charset=utf-8", b"Not Found")
 

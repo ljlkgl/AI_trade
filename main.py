@@ -23,6 +23,7 @@ import json
 import logging
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Optional
 
 from agents.confirmer import Confirmer
@@ -45,6 +46,7 @@ from trading.risk import RiskManager, build_min_margin_context
 from trading.risk_lock import RiskLockStore
 from trading.rounds import RoundLog, RuntimeState
 from trading.watch import WatchStore
+from strategies.sol_30m_deliver import Sol30mStrategy
 
 logging.basicConfig(
     level=logging.INFO,
@@ -110,6 +112,27 @@ def _live_open_order_ids(open_orders_by_symbol: dict[str, list]) -> set[str]:
     return live
 
 
+# 决策引擎切换持久化目录（与 web.py 的 _STATE_DIR 一致）
+_STATE_DIR = Path(__file__).resolve().parent / "state"
+
+
+def _read_strategy() -> str:
+    """读取当前决策引擎（ai / sol_30m_deliver）。
+
+    web 端 /set_strategy 写入 state/strategy.json；文件缺失/非法时回退到
+    config.strategy（默认 ai）。主进程每轮读取，运行中切换即时生效。
+    """
+    mode = ""
+    try:
+        with open(_STATE_DIR / "strategy.json", "r", encoding="utf-8") as f:
+            mode = str(json.load(f).get("strategy", "")).strip().lower()
+    except Exception:  # noqa: BLE001
+        pass
+    if mode not in ("ai", "sol_30m_deliver"):
+        mode = config.strategy if config.strategy in ("ai", "sol_30m_deliver") else "ai"
+    return mode
+
+
 class TradingSystem:
     """整合行情→分析→决策→风控→执行→假设记录的主流程。"""
 
@@ -170,6 +193,8 @@ class TradingSystem:
         self.analyst_state = AnalystStateStore()
         self.symbols = config.symbols
         self._last_reflection: Optional[dict] = None
+        # SOL 30m 规则策略实例（惰性创建，仅在切换到该策略时实例化）
+        self._sol_strategy = None
         # 本轮被「唤醒条件」提前唤醒时的触发快照（供决策者检查其它条件是否也接近触发）
         self._wake_snapshot: Optional[list[dict]] = None
         self._web_controller: Optional[WebServerController] = None
@@ -208,6 +233,25 @@ class TradingSystem:
             )
             return False
 
+    def _sol_strategy_decision(self, account, price_map, symbol_info_map) -> TradingDecision:
+        """SOL 30m 规则策略决策：惰性实例化策略，全程不调用 LLM。
+
+        失败（如 K 线不足）时返回保守兜底：不产生任何指令，维持原状。
+        """
+        if self._sol_strategy is None:
+            self._sol_strategy = Sol30mStrategy(self.client)
+            logger.info("已初始化 SOL_30m_deliver 规则策略")
+        try:
+            return self._sol_strategy.decide(account, price_map, symbol_info_map)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("SOL_30m 规则策略决策失败，本轮保守维持原状: %s", exc)
+            return TradingDecision(
+                market_assessment=f"SOL_30m 规则策略计算失败，本轮保守维持原状（{exc}）",
+                instructions=[],
+                risk_notes="规则策略计算失败，不产生任何指令，保留现有持仓与挂单。",
+                watch_conditions=[],
+            )
+
     def run_once(self) -> dict:
         """执行一轮完整的 行情→分析→决策→风控→执行→假设记录。"""
         logger.info("===== 开始一轮交易决策 @ %s =====", datetime.now().isoformat())
@@ -222,6 +266,14 @@ class TradingSystem:
             "testnet": config.binance_testnet,
             "dry_run": config.dry_run,
         }
+
+        # 0. 决策引擎选择：ai=AI 多智能体；sol_30m_deliver=SOL 30m 规则策略。
+        #    每轮读取 state/strategy.json（web 端 /set_strategy 写入），运行中切换即时生效。
+        strategy_mode = _read_strategy()
+        result["strategy"] = strategy_mode
+        use_rule = strategy_mode == "sol_30m_deliver"
+        if use_rule:
+            logger.info("本轮使用 SOL_30m_deliver 规则策略（不调用 LLM）")
 
         # 1. 最先获取账户现状（决策者必需）
         try:
@@ -285,10 +337,14 @@ class TradingSystem:
         else:
             logger.info("未成交挂单: 无")
 
-        # 2. 提前取价与精度（构建「最少初始保证金」上下文；后续风控校验复用）
+        # 2. 提前取价与精度（构建「最少初始保证金」上下文；后续风控校验复用）。
+        #    规则策略仅操作 SOLUSDT：即便不在 SYMBOLS 里也须拉取 SOL 价格/精度供风控校验
         price_map: dict[str, float] = {}
         symbol_info_map = {}
-        for sym in self.symbols:
+        _px_symbols = list(self.symbols)
+        if use_rule and "SOLUSDT" not in _px_symbols:
+            _px_symbols.append("SOLUSDT")
+        for sym in _px_symbols:
             try:
                 price_map[sym] = self.client.get_ticker_price(sym)
                 symbol_info_map[sym] = self.client.get_symbol_info(sym)
@@ -299,170 +355,184 @@ class TradingSystem:
         )
         result["min_margin_context"] = min_margin_context
 
-        # 3. 操作理由列表：先自动清理过期条目（仓位已完全平掉 / 挂单撤销且不再续挂），
-        #    再渲染当前进行中操作的理由列表，供决策者读取与操作（thesis_ops）
-        account_positions = {p.symbol: p for p in account.positions}
-        if not config.dry_run:
+        if use_rule:
+            # ==== SOL 30m 规则策略决策：不调用任何 LLM（分析师/决策者/确认者/复盘全跳过）====
+            decision = self._sol_strategy_decision(account, price_map, symbol_info_map)
+            result["market_assessment"] = decision.market_assessment
+            result["risk_notes"] = decision.risk_notes
+            result["thesis_ops"] = [op.model_dump() for op in decision.thesis_ops]
+            result["watch_conditions"] = []
+            # 规则策略不设条件唤醒：清除 AI 时代遗留的唤醒条件，避免多余提前唤醒
             try:
-                pruned = self.theses.prune_stale(
-                    account_positions,
-                    open_orders_by_symbol,
-                    live_open_order_ids=_live_open_order_ids(open_orders_by_symbol),
-                )
-                if pruned:
-                    logger.info("操作理由列表已自动清理 %d 条过期条目", pruned)
+                self.watch_store.replace([])
             except Exception as exc:  # noqa: BLE001
-                logger.warning("操作理由列表清理失败: %s", exc)
-        thesis_context = self.theses.render_context()
-
-        # 二-状态同步：HOLD/计划挂单状态核对。
-        # 理由列表里 kind=limit_order 的条目标记了「计划挂单」，但交易所实际未成交挂单中
-        # 可能根本没有对应订单（例如下单被风控拦截、或从未成功提交）。这类"计划 vs 实际"
-        # 不一致会导致决策者继续假设挂单存在（如"维持 ETH 限价 1910 挂单"），造成回踩
-        # 入场被静默丢失。这里逐条核对：绑定 order_id 缺失、或绑定单号已不在存活挂单中的
-        # 挂单理由，一律注入告警到决策上下文，提示决策者核实/重挂/更新理由。
-        try:
-            live_ids_now = _live_open_order_ids(open_orders_by_symbol)
-            ghost_orders = []
-            for thesis in self.theses.all():
-                if thesis.get("kind") != "limit_order":
-                    continue
-                if not thesis.get("symbol"):
-                    continue
-                bound_id = thesis.get("order_id")
-                if not bound_id or str(bound_id) not in live_ids_now:
-                    ghost_orders.append(thesis)
-            if ghost_orders:
-                alert = "\n\n## 计划挂单状态告警（理由列表 vs 交易所实际订单不一致）"
-                alert += (
-                    "\n以下 limit_order 理由在交易所未成交挂单中**找不到对应实际订单**"
-                    "（无绑定单号，或绑定单号已不复存活）。决策者不应再假设这些挂单仍然存在；"
-                    "请核实情况并决定：重新挂单 / 按当前行情调整 / 更新或删除该理由："
-                )
-                for t in ghost_orders:
-                    alert += (
-                        f"\n- [{t.get('id')}] {t.get('symbol')} @ "
-                        f"{t.get('entry_price')}"
-                        f"（方向: {t.get('direction')}；绑定单号: {t.get('order_id')}）"
+                logger.warning("清理唤醒条件失败: %s", exc)
+        else:
+            # ============ AI 多智能体决策路径 ============
+            # 3. 操作理由列表：先自动清理过期条目（仓位已完全平掉 / 挂单撤销且不再续挂），
+            #    再渲染当前进行中操作的理由列表，供决策者读取与操作（thesis_ops）
+            account_positions = {p.symbol: p for p in account.positions}
+            if not config.dry_run:
+                try:
+                    pruned = self.theses.prune_stale(
+                        account_positions,
+                        open_orders_by_symbol,
+                        live_open_order_ids=_live_open_order_ids(open_orders_by_symbol),
                     )
-                logger.warning(
-                    "计划挂单状态核对：发现 %d 条理由在交易所无对应实际订单", len(ghost_orders)
+                    if pruned:
+                        logger.info("操作理由列表已自动清理 %d 条过期条目", pruned)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("操作理由列表清理失败: %s", exc)
+            thesis_context = self.theses.render_context()
+
+            # 二-状态同步：HOLD/计划挂单状态核对。
+            # 理由列表里 kind=limit_order 的条目标记了「计划挂单」，但交易所实际未成交挂单中
+            # 可能根本没有对应订单（例如下单被风控拦截、或从未成功提交）。这类"计划 vs 实际"
+            # 不一致会导致决策者继续假设挂单存在（如"维持 ETH 限价 1910 挂单"），造成回踩
+            # 入场被静默丢失。这里逐条核对：绑定 order_id 缺失、或绑定单号已不在存活挂单中的
+            # 挂单理由，一律注入告警到决策上下文，提示决策者核实/重挂/更新理由。
+            try:
+                live_ids_now = _live_open_order_ids(open_orders_by_symbol)
+                ghost_orders = []
+                for thesis in self.theses.all():
+                    if thesis.get("kind") != "limit_order":
+                        continue
+                    if not thesis.get("symbol"):
+                        continue
+                    bound_id = thesis.get("order_id")
+                    if not bound_id or str(bound_id) not in live_ids_now:
+                        ghost_orders.append(thesis)
+                if ghost_orders:
+                    alert = "\n\n## 计划挂单状态告警（理由列表 vs 交易所实际订单不一致）"
+                    alert += (
+                        "\n以下 limit_order 理由在交易所未成交挂单中**找不到对应实际订单**"
+                        "（无绑定单号，或绑定单号已不复存活）。决策者不应再假设这些挂单仍然存在；"
+                        "请核实情况并决定：重新挂单 / 按当前行情调整 / 更新或删除该理由："
+                    )
+                    for t in ghost_orders:
+                        alert += (
+                            f"\n- [{t.get('id')}] {t.get('symbol')} @ "
+                            f"{t.get('entry_price')}"
+                            f"（方向: {t.get('direction')}；绑定单号: {t.get('order_id')}）"
+                        )
+                    logger.warning(
+                        "计划挂单状态核对：发现 %d 条理由在交易所无对应实际订单", len(ghost_orders)
+                    )
+                    thesis_context += alert
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("计划挂单状态核对失败: %s", exc)
+
+            result["thesis_context"] = thesis_context
+
+            # 4. 市场上下文（多币种多周期）+ 新闻
+            try:
+                market_context = self.market_data.build_market_context_for_symbols(
+                    self.symbols, limit=config.klines_limit
                 )
-                thesis_context += alert
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("计划挂单状态核对失败: %s", exc)
+            except Exception as exc:  # noqa: BLE001
+                logger.error("获取行情失败: %s", exc)
+                result["error"] = f"行情获取失败: {exc}"
+                return result
+            result["market_context_len"] = len(market_context)
 
-        result["thesis_context"] = thesis_context
+            try:
+                news_context = self.news_service.build_news_context(self.symbols)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("获取新闻失败（继续分析）: %s", exc)
+                news_context = "（新闻获取失败，本轮忽略新闻面）"
+            result["news_context_len"] = len(news_context)
 
-        # 4. 市场上下文（多币种多周期）+ 新闻
-        try:
-            market_context = self.market_data.build_market_context_for_symbols(
-                self.symbols, limit=config.klines_limit
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.error("获取行情失败: %s", exc)
-            result["error"] = f"行情获取失败: {exc}"
-            return result
-        result["market_context_len"] = len(market_context)
+            # 5. 市场分析师产出结构化报告（多周期指标+K线 + 新闻 + 跨轮状态 + 现价）
+            try:
+                analyst_out = self.market_analyst.analyze(
+                    market_context,  # 多周期指标快照（布林/均线/K线，主输入）
+                    news_context,
+                    prior_context=self.analyst_state.format_prior_context(),
+                    current_prices=price_map,
+                )
+                market_report = self._analyst_to_text(analyst_out)
+                logger.info("市场分析报告已生成（%d 字符）", len(market_report))
+            except AllLLMUnavailable as exc:
+                return self._handle_llm_outage(exc, result)
+            except Exception as exc:  # noqa: BLE001
+                logger.error("市场分析失败: %s", exc)
+                result["error"] = f"市场分析失败: {exc}"
+                return result
+            result["market_report"] = market_report
+            result["analyst_state"] = self._analyst_state_bytes(analyst_out)
 
-        try:
-            news_context = self.news_service.build_news_context(self.symbols)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("获取新闻失败（继续分析）: %s", exc)
-            news_context = "（新闻获取失败，本轮忽略新闻面）"
-        result["news_context_len"] = len(news_context)
+            # 5.5 分析师翻转检测 + 持久化状态（供下一轮对照）
+            #     在方向翻转时醒目记录日志，暴露入场级判断的漂移，避免"报告永远积极"
+            try:
+                previous_assets = self.analyst_state.prior_assets_by_symbol()
+                # 先写回本轮（detect_flips 读当前 last），再做差异说明
+                self.analyst_state.save_views(
+                    analyst_out.market_overview,
+                    [a.model_dump() for a in analyst_out.assets],
+                    [n.model_dump() for n in analyst_out.news_pricing],
+                )
+                self._log_analyst_changes(previous_assets, analyst_out.assets)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("分析师状态持久化失败（不影响本轮）: %s", exc)
 
-        # 5. 市场分析师产出结构化报告（多周期指标+K线 + 新闻 + 跨轮状态 + 现价）
-        try:
-            analyst_out = self.market_analyst.analyze(
-                market_context,  # 多周期指标快照（布林/均线/K线，主输入）
-                news_context,
-                prior_context=self.analyst_state.format_prior_context(),
-                current_prices=price_map,
-            )
-            market_report = self._analyst_to_text(analyst_out)
-            logger.info("市场分析报告已生成（%d 字符）", len(market_report))
-        except AllLLMUnavailable as exc:
-            return self._handle_llm_outage(exc, result)
-        except Exception as exc:  # noqa: BLE001
-            logger.error("市场分析失败: %s", exc)
-            result["error"] = f"市场分析失败: {exc}"
-            return result
-        result["market_report"] = market_report
-        result["analyst_state"] = self._analyst_state_bytes(analyst_out)
-
-        # 5.5 分析师翻转检测 + 持久化状态（供下一轮对照）
-        #     在方向翻转时醒目记录日志，暴露入场级判断的漂移，避免"报告永远积极"
-        try:
-            previous_assets = self.analyst_state.prior_assets_by_symbol()
-            # 先写回本轮（detect_flips 读当前 last），再做差异说明
-            self.analyst_state.save_views(
-                analyst_out.market_overview,
-                [a.model_dump() for a in analyst_out.assets],
-                [n.model_dump() for n in analyst_out.news_pricing],
-            )
-            self._log_analyst_changes(previous_assets, analyst_out.assets)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("分析师状态持久化失败（不影响本轮）: %s", exc)
-
-        # 6. 决策者输出结构化举措（含账户现状 + 操作理由列表 + 最少保证金 + 经验库）
-        #     新闻定价时效（分析师给出 priced_in_by_utc / window_hours）拼进 news_context，
-        #     让规则16真正判断"未定价剩余空间"窗口是否仍有效，减少滞后错过/误追。
-        try:
-            experience_context = self.experiences.format_for_context()
-            news_ctx_for_decider = self._append_news_timing(news_context, analyst_out)
-            wake_ctx = self._render_wake_context(price_map)
-            decision = self.decision_maker.decide(
-                market_report, news_ctx_for_decider, thesis_context, account,
-                experience_context=experience_context,
-                open_orders_by_symbol=open_orders_by_symbol,
-                min_margin_context=min_margin_context,
-                last_round_feedback=self.runtime.last_feedback(),
-                current_watch_context=wake_ctx,
-            )
-            logger.info(
-                "决策: %d 条指令, %d 条理由操作, 评估=%s",
-                len(decision.instructions),
-                len(decision.thesis_ops),
-                decision.market_assessment[:120],
-            )
-        except AllLLMUnavailable as exc:
-            return self._handle_llm_outage(exc, result)
-        except Exception as exc:  # noqa: BLE001
-            # 保守默认：决策解析失败（重试后仍失败）时，维持原状继续本轮，
-            # 不产生任何指令、不触碰操作理由、保留现有唤醒条件——避免整轮被丢弃
-            # 而"静默丢失"计划挂单或错过风险审视窗口。
-            logger.error("决策失败（含重试），采用保守默认维持原状: %s", exc)
-            existing_watch = self.watch_store.all()
-            decision = TradingDecision(
-                market_assessment=(
-                    "决策解析失败，本轮保守维持原状（不产生任何新指令，保留现有挂单/持仓）。"
-                ),
-                instructions=[],
-                thesis_ops=[],
-                risk_notes=(
-                    "决策解析失败已按保守策略处理：不做任何操作，保留现有挂单与持仓，"
-                    "不修改操作理由，保存现有唤醒条件。请在下轮核验计划挂单是否存在。"
-                ),
-                watch_conditions=[
-                    WakeCondition(**{k: v for k, v in w.items()
-                                     if k in ("symbol", "condition", "value", "note",
-                                              "volume_mult", "duration_seconds")})
-                    for w in existing_watch
-                ],
-            )
-            logger.warning("决策失败已生成保守兜底（HOLD 维持原状），原因: %s", exc)
-        result["market_assessment"] = decision.market_assessment
-        result["risk_notes"] = decision.risk_notes
-        result["thesis_ops"] = [op.model_dump() for op in decision.thesis_ops]
-        # 7. 更新唤醒条件（模型可在正常循环外设定价格触发，全量替换）
-        result["watch_conditions"] = [
-            c.model_dump() for c in decision.watch_conditions
-        ]
-        try:
-            self.watch_store.replace(decision.watch_conditions)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("更新唤醒条件失败: %s", exc)
+            # 6. 决策者输出结构化举措（含账户现状 + 操作理由列表 + 最少保证金 + 经验库）
+            #     新闻定价时效（分析师给出 priced_in_by_utc / window_hours）拼进 news_context，
+            #     让规则16真正判断"未定价剩余空间"窗口是否仍有效，减少滞后错过/误追。
+            try:
+                experience_context = self.experiences.format_for_context()
+                news_ctx_for_decider = self._append_news_timing(news_context, analyst_out)
+                wake_ctx = self._render_wake_context(price_map)
+                decision = self.decision_maker.decide(
+                    market_report, news_ctx_for_decider, thesis_context, account,
+                    experience_context=experience_context,
+                    open_orders_by_symbol=open_orders_by_symbol,
+                    min_margin_context=min_margin_context,
+                    last_round_feedback=self.runtime.last_feedback(),
+                    current_watch_context=wake_ctx,
+                )
+                logger.info(
+                    "决策: %d 条指令, %d 条理由操作, 评估=%s",
+                    len(decision.instructions),
+                    len(decision.thesis_ops),
+                    decision.market_assessment[:120],
+                )
+            except AllLLMUnavailable as exc:
+                return self._handle_llm_outage(exc, result)
+            except Exception as exc:  # noqa: BLE001
+                # 保守默认：决策解析失败（重试后仍失败）时，维持原状继续本轮，
+                # 不产生任何指令、不触碰操作理由、保留现有唤醒条件——避免整轮被丢弃
+                # 而"静默丢失"计划挂单或错过风险审视窗口。
+                logger.error("决策失败（含重试），采用保守默认维持原状: %s", exc)
+                existing_watch = self.watch_store.all()
+                decision = TradingDecision(
+                    market_assessment=(
+                        "决策解析失败，本轮保守维持原状（不产生任何新指令，保留现有挂单/持仓）。"
+                    ),
+                    instructions=[],
+                    thesis_ops=[],
+                    risk_notes=(
+                        "决策解析失败已按保守策略处理：不做任何操作，保留现有挂单与持仓，"
+                        "不修改操作理由，保存现有唤醒条件。请在下轮核验计划挂单是否存在。"
+                    ),
+                    watch_conditions=[
+                        WakeCondition(**{k: v for k, v in w.items()
+                                         if k in ("symbol", "condition", "value", "note",
+                                                  "volume_mult", "duration_seconds")})
+                        for w in existing_watch
+                    ],
+                )
+                logger.warning("决策失败已生成保守兜底（HOLD 维持原状），原因: %s", exc)
+            result["market_assessment"] = decision.market_assessment
+            result["risk_notes"] = decision.risk_notes
+            result["thesis_ops"] = [op.model_dump() for op in decision.thesis_ops]
+            # 7. 更新唤醒条件（模型可在正常循环外设定价格触发，全量替换）
+            result["watch_conditions"] = [
+                c.model_dump() for c in decision.watch_conditions
+            ]
+            try:
+                self.watch_store.replace(decision.watch_conditions)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("更新唤醒条件失败: %s", exc)
 
         # 8. 风控校验（价格/精度已在第 2 步获取，此处复用）
         passed, risk_results = self.risk.validate_decision(
@@ -524,35 +594,41 @@ class TradingSystem:
                     f"- {r.get('symbol')} {r.get('action')} -> {r.get('status')}"
                     for r in exec_results
                 )
-                # 执行前逐条确认
-                try:
-                    conf = self.confirmer.confirm(
-                        ins, mark, _format_account_ctx(account_snapshot, open_orders_by_symbol),
-                        prior_summary, decision.market_assessment,
-                    )
-                except AllLLMUnavailable as exc:
-                    return self._handle_llm_outage(exc, result)
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning("指令确认失败，跳过 %s: %s", ins.symbol, exc)
-                    exec_results.append({
-                        "symbol": ins.symbol, "action": ins.action.value,
-                        "status": "SKIPPED", "error": f"确认失败: {exc}",
+                # 执行前逐条确认（规则策略不调用 LLM，跳过确认直接执行）
+                if not use_rule:
+                    try:
+                        conf = self.confirmer.confirm(
+                            ins, mark, _format_account_ctx(account_snapshot, open_orders_by_symbol),
+                            prior_summary, decision.market_assessment,
+                        )
+                    except AllLLMUnavailable as exc:
+                        return self._handle_llm_outage(exc, result)
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning("指令确认失败，跳过 %s: %s", ins.symbol, exc)
+                        exec_results.append({
+                            "symbol": ins.symbol, "action": ins.action.value,
+                            "status": "SKIPPED", "error": f"确认失败: {exc}",
+                        })
+                        continue
+                    confirmations.append({
+                        "symbol": ins.symbol, "decision": conf.decision.value,
+                        "reason": conf.reason,
                     })
-                    continue
-                confirmations.append({
-                    "symbol": ins.symbol, "decision": conf.decision.value,
-                    "reason": conf.reason,
-                })
-                if conf.decision == ConfirmationAction.SKIP:
-                    logger.info("确认者 SKIP %s: %s", ins.symbol, conf.reason[:120])
-                    exec_results.append({
-                        "symbol": ins.symbol, "action": ins.action.value,
-                        "status": "SKIPPED", "error": conf.reason,
+                    if conf.decision == ConfirmationAction.SKIP:
+                        logger.info("确认者 SKIP %s: %s", ins.symbol, conf.reason[:120])
+                        exec_results.append({
+                            "symbol": ins.symbol, "action": ins.action.value,
+                            "status": "SKIPPED", "error": conf.reason,
+                        })
+                        continue
+                else:
+                    confirmations.append({
+                        "symbol": ins.symbol, "decision": "PROCEED",
+                        "reason": "SOL_30m 规则策略跳过 LLM 确认",
                     })
-                    continue
 
                 final_ins = ins
-                if conf.decision == ConfirmationAction.REPLACE:
+                if not use_rule and conf.decision == ConfirmationAction.REPLACE:
                     new_ins = conf.instruction
                     info = symbol_info_map.get(new_ins.symbol)
                     m = price_map.get(new_ins.symbol, 0)
@@ -630,13 +706,15 @@ class TradingSystem:
         result["thesis_count"] = self.theses.count()
 
         # 11. 确认者复盘本轮（反思者职责已并入确认者），直接维护经验库（写入/修改/删除）
-        self._reflect_and_apply(
-            decision, exec_results, account, thesis_context, market_report,
-            open_orders_by_symbol=open_orders_by_symbol,
-            risk_blocked=result.get("risk_blocked", []),
-        )
-        if self._last_reflection:
-            result["reflection"] = self._last_reflection
+        #     规则策略不调用 LLM，跳过复盘
+        if not use_rule:
+            self._reflect_and_apply(
+                decision, exec_results, account, thesis_context, market_report,
+                open_orders_by_symbol=open_orders_by_symbol,
+                risk_blocked=result.get("risk_blocked", []),
+            )
+            if self._last_reflection:
+                result["reflection"] = self._last_reflection
 
         logger.info("===== 本轮结束 =====")
         return result

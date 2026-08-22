@@ -93,12 +93,17 @@ class BinanceClient:
         symbol: str,
         interval: str = "1h",
         limit: int = 500,
+        end_time: Optional[int] = None,
     ) -> list[Candle]:
-        """获取K线，返回按时间升序排列的蜡烛。"""
-        data = self._public_request(
-            "/fapi/v1/klines",
-            {"symbol": symbol, "interval": interval, "limit": limit},
-        )
+        """获取K线，返回按时间升序排列的蜡烛。
+
+        end_time: 可选，返回开仓时间 ≤ end_time（毫秒时间戳）的K线，
+        用于按 endTime 向前分页拉取历史（配合 limit=1500 上限逐页回溯）。
+        """
+        params = {"symbol": symbol, "interval": interval, "limit": limit}
+        if end_time is not None:
+            params["endTime"] = int(end_time)
+        data = self._public_request("/fapi/v1/klines", params)
         candles = []
         for row in data:
             candles.append(

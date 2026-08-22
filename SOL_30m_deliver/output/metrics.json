@@ -1,0 +1,18 @@
+{
+  "annual_return": 1.5639,
+  "annual_volatility": 0.5667,
+  "sharpe": 2.7596,
+  "max_drawdown": 0.4086,
+  "seg_std": 2.9021,
+  "autocorr": -0.0239,
+  "lin_r2": 0.9348,
+  "mean_leverage": 0.5591,
+  "start": "2022-08-02",
+  "end": "2026-08-22",
+  "total_turnover": 2773.86,
+  "total_cost": 1.386928,
+  "cost_vs_gross": 0.1282,
+  "fee_per_year": 0.230008,
+  "fee_rate": 0.0004,
+  "slip_rate": 0.0001
+}
