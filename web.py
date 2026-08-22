@@ -99,7 +99,7 @@ def _read_strategy() -> str:
     except Exception:  # noqa: BLE001
         pass
     if mode not in ("ai", "sol_30m_deliver"):
-        mode = config.strategy if config.strategy in ("ai", "sol_30m_deliver") else "ai"
+        mode = config.strategy if config.strategy in ("ai", "sol_30m_deliver") else "sol_30m_deliver"
     return mode
 
 
@@ -461,7 +461,7 @@ def _render(status: dict[str, Any]) -> str:
   {' <span class="muted">' + h(status['note']) + '</span>' if status.get('note') else ''}""")
 
     # ---- 决策引擎切换 ----
-    cur_strategy = status.get("strategy") or "ai"
+    cur_strategy = status.get("strategy") or "sol_30m_deliver"
     cur_label = _STRATEGY_LABELS.get(cur_strategy, cur_strategy)
     rows.append(f"""<section id="strategy" class="card"><div class="c-head"><span class="c-bar"></span><h2>决策引擎</h2></div><div class="c-body">
 <div class="strat-row">

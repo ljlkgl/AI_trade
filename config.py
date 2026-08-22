@@ -65,10 +65,11 @@ class Config:
 
         # ---- 决策引擎选择 ----
         # ai=AI 多智能体决策；sol_30m_deliver=SOL 30m 递送趋势策略（纯规则，不调用 LLM）。
-        # 该值仅为默认值：web 端 /set_strategy 可动态切换，持久化到 state/strategy.json
-        self.strategy = os.getenv("STRATEGY", "ai").strip().lower()
+        # 默认使用 sol_30m_deliver；该值仅为默认值：web 端 /set_strategy 可动态切换，
+        # 持久化到 state/strategy.json
+        self.strategy = os.getenv("STRATEGY", "sol_30m_deliver").strip().lower()
         if self.strategy not in ("ai", "sol_30m_deliver"):
-            self.strategy = "ai"
+            self.strategy = "sol_30m_deliver"
 
         # ---- 交易标的 ----
         raw_symbols = os.getenv("SYMBOLS", "BTCUSDT,ETHUSDT,SOLUSDT")

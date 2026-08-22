@@ -120,7 +120,7 @@ def _read_strategy() -> str:
     """读取当前决策引擎（ai / sol_30m_deliver）。
 
     web 端 /set_strategy 写入 state/strategy.json；文件缺失/非法时回退到
-    config.strategy（默认 ai）。主进程每轮读取，运行中切换即时生效。
+    config.strategy（默认 sol_30m_deliver）。主进程每轮读取，运行中切换即时生效。
     """
     mode = ""
     try:
@@ -129,7 +129,7 @@ def _read_strategy() -> str:
     except Exception:  # noqa: BLE001
         pass
     if mode not in ("ai", "sol_30m_deliver"):
-        mode = config.strategy if config.strategy in ("ai", "sol_30m_deliver") else "ai"
+        mode = config.strategy if config.strategy in ("ai", "sol_30m_deliver") else "sol_30m_deliver"
     return mode
 
 
