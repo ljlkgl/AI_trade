@@ -137,9 +137,14 @@ class BinanceClient:
         if symbol in self._symbols_cache:
             return self._symbols_cache[symbol]
         data = self._public_request("/fapi/v1/exchangeInfo", {"symbol": symbol})
-        if not data.get("symbols"):
+        # 注意：该端点的 symbol 参数不一定生效（实测主网/测试网均返回全量交易对），
+        # 必须按请求的 symbol 精确匹配，绝不能取 symbols[0]（首个固定是 BTCUSDT，
+        # 会把 BTC 的精度误用到其它币种导致 Precision 被拒）。
+        info = next(
+            (s for s in data.get("symbols", []) if s.get("symbol") == symbol), None
+        )
+        if info is None:
             raise BinanceError(f"Unknown symbol: {symbol}")
-        info = data["symbols"][0]
         filters = {f["filterType"]: f for f in info.get("filters", [])}
         price_filter = filters.get("PRICE_FILTER", {})
         lot_filter = filters.get("LOT_SIZE", {})
